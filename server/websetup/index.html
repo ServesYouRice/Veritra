@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Private Messenger Setup</title>
+    <style>
+      :root { color-scheme: light dark; font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: #f4f7f8; color: #162024; }
+      main { width: min(560px, calc(100vw - 32px)); background: #fff; border: 1px solid #d8e1e5; border-radius: 8px; padding: 24px; box-shadow: 0 12px 28px rgb(20 38 44 / 10%); }
+      h1 { margin: 0 0 8px; font-size: 24px; letter-spacing: 0; }
+      p { margin: 0 0 18px; color: #526269; }
+      label { display: block; margin: 14px 0 6px; font-weight: 650; }
+      input { width: 100%; box-sizing: border-box; padding: 11px 12px; border-radius: 6px; border: 1px solid #b9c7cd; font: inherit; }
+      button { margin-top: 18px; border: 0; border-radius: 6px; padding: 11px 14px; font: inherit; font-weight: 700; background: #126f7a; color: white; cursor: pointer; }
+      pre { white-space: pre-wrap; background: #102024; color: #d8f3f6; padding: 12px; border-radius: 6px; overflow: auto; }
+      @media (prefers-color-scheme: dark) { body { background: #101719; color: #edf5f7; } main { background: #172124; border-color: #314045; } p { color: #a7b7bd; } }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Private Messenger Setup</h1>
+      <p>Create the first owner account for this self-hosted instance.</p>
+      <form id="setup-form">
+        <label for="instance">Instance name</label>
+        <input id="instance" name="instance_name" value="Private Messenger" autocomplete="organization">
+        <label for="username">Owner username</label>
+        <input id="username" name="username" autocomplete="username" required>
+        <label for="password">Password</label>
+        <input id="password" name="password" type="password" autocomplete="new-password" minlength="12" required>
+        <label for="device">Device name</label>
+        <input id="device" name="device_name" value="Setup browser" required>
+        <button type="submit">Create owner</button>
+      </form>
+      <pre id="result" hidden></pre>
+    </main>
+    <script>
+      const form = document.querySelector('#setup-form');
+      const result = document.querySelector('#result');
+      form.addEventListener('submit', async (event) => {
+        event.preventDefault();
+        const data = Object.fromEntries(new FormData(form).entries());
+        data.device_key_package = btoa('setup-non-production-key-package-placeholder');
+        const response = await fetch('/api/v1/setup/owner', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', 'x-private-messenger-setup': '1' },
+          body: JSON.stringify(data),
+        });
+        result.hidden = false;
+        result.textContent = JSON.stringify(await response.json(), null, 2);
+      });
+    </script>
+  </body>
+</html>

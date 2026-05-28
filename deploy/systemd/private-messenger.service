@@ -1,0 +1,22 @@
+[Unit]
+Description=Private Messenger server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=private-messenger
+Group=private-messenger
+Environment=PRIVATE_MESSENGER_ADDR=:8080
+Environment=PRIVATE_MESSENGER_DATA_DIR=/var/lib/private-messenger
+ExecStart=/usr/local/bin/messenger-server serve
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/var/lib/private-messenger
+
+[Install]
+WantedBy=multi-user.target
+

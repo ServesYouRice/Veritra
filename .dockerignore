@@ -1,0 +1,9 @@
+.git
+data
+mobile/.dart_tool
+mobile/build
+crypto/rust/target
+server/coverage.out
+dist
+bin
+

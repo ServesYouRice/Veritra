@@ -1,0 +1,12 @@
+{
+	email admin@example.com
+}
+
+messenger.example.com {
+	reverse_proxy messenger:8080
+	header {
+		Referrer-Policy "no-referrer"
+		X-Content-Type-Options "nosniff"
+	}
+}
+

@@ -1,0 +1,23 @@
+# Third Party Notices
+
+This project is licensed AGPL-3.0-or-later. Dependency licenses must be compatible with that license and tracked here before release.
+
+## Direct Runtime Dependencies
+
+| Component | Use | License | Notes |
+| --- | --- | --- | --- |
+| `modernc.org/sqlite` | Pure-Go SQLite driver | BSD-style / compatible notices required | Chosen to support single-binary builds without CGO. Verify exact transitive notices during release. |
+| `golang.org/x/crypto` | Password hashing helpers | BSD-3-Clause | Used for password fallback hashing. |
+| Flutter SDK | Mobile client framework | BSD-3-Clause | Toolchain, not vendored. |
+
+## Reference Projects Studied, Not Copied
+
+Signal/libsignal, OpenMLS, Matrix/Synapse/Element, SimpleX Chat, Mattermost, Zulip, Rocket.Chat, Stoat/Revolt, PocketBase, Pion, LiveKit, Caddy, UnifiedPush, ntfy, and MiroTalk were studied for architecture, deployment, crypto, licensing, and self-hosting lessons. No source code from these projects is copied into this repository.
+
+## Release Checklist
+
+- Run dependency license scan.
+- Update this file with exact versions and transitive notices.
+- Preserve attribution for any permissively licensed code or assets.
+- Re-check GPL/AGPL compatibility before adding copyleft dependencies.
+

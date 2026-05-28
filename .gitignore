@@ -1,0 +1,31 @@
+# Local data
+data/
+*.db
+*.db-shm
+*.db-wal
+
+# Build outputs
+bin/
+dist/
+build/
+coverage/
+target/
+
+# Go
+server/.cache/
+server/coverage.out
+
+# Flutter/Dart
+mobile/.dart_tool/
+mobile/.flutter-plugins
+mobile/.flutter-plugins-dependencies
+mobile/.packages
+
+# Rust
+crypto/rust/target/
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

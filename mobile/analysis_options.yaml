@@ -1,0 +1,12 @@
+analyzer:
+  exclude:
+    - build/**
+  errors:
+    invalid_annotation_target: ignore
+
+linter:
+  rules:
+    avoid_print: true
+    prefer_final_locals: true
+    unnecessary_this: true
+
