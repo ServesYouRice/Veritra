@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -37,12 +38,15 @@ func (a *API) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/v1/register", a.register)
 	mux.HandleFunc("POST /api/v1/invites", a.withAuth(a.createInvite))
 	mux.HandleFunc("GET /api/v1/devices/me", a.withAuth(a.listDevices))
+	mux.HandleFunc("POST /api/v1/device-links", a.withAuth(a.createDeviceLink))
+	mux.HandleFunc("POST /api/v1/device-links/claim", a.claimDeviceLink)
 	mux.HandleFunc("POST /api/v1/communities", a.withAuth(a.createCommunity))
 	mux.HandleFunc("POST /api/v1/conversations", a.withAuth(a.createConversation))
 	mux.HandleFunc("GET /api/v1/conversations", a.withAuth(a.listConversations))
 	mux.HandleFunc("POST /api/v1/messages/envelopes", a.withAuth(a.createMessageEnvelope))
 	mux.HandleFunc("POST /api/v1/attachments", a.withAuth(a.uploadAttachment))
 	mux.HandleFunc("POST /api/v1/push/subscriptions", a.withAuth(a.createPushSubscription))
+	mux.HandleFunc("DELETE /api/v1/push/subscriptions/{id}", a.withAuth(a.deletePushSubscription))
 	mux.HandleFunc("POST /api/v1/calls", a.withAuth(a.createCall))
 	mux.HandleFunc("GET /api/v1/sync/ws", a.syncWebSocket)
 	mux.HandleFunc("GET /api/v1/sync/events", a.withAuth(a.syncEvents))
@@ -53,6 +57,7 @@ func (a *API) Register(mux *http.ServeMux) {
 	mux.HandleFunc("/api/v1/messages/", a.withAuth(a.messageSubroute))
 	mux.HandleFunc("/api/v1/conversations/", a.withAuth(a.conversationSubroute))
 	mux.HandleFunc("/api/v1/communities/", a.withAuth(a.communitySubroute))
+	mux.HandleFunc("/api/v1/device-links/", a.deviceLinkSubroute)
 }
 
 func (a *API) health(w http.ResponseWriter, r *http.Request) {
@@ -134,6 +139,7 @@ func (a *API) createOwner(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "session_create_failed")
 		return
 	}
+	a.Store.RecordAuditEvent(r.Context(), &created.Account.ID, "owner.created", map[string]string{"device_id": created.Device.ID})
 	writeJSON(w, http.StatusCreated, map[string]interface{}{"account": created.Account, "device": created.Device, "token": token})
 }
 
@@ -148,8 +154,15 @@ func (a *API) login(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	record, err := a.Store.LoginRecord(r.Context(), req.Username, req.DeviceID)
-	if err != nil || !auth.VerifyPassword(record.PasswordHash, req.Password) {
+	record, lookupErr := a.Store.LoginRecord(r.Context(), req.Username, req.DeviceID)
+	// Always run bcrypt — against a dummy hash when the lookup failed — so
+	// response time does not leak whether the username exists.
+	var storedHash string
+	if lookupErr == nil {
+		storedHash = record.PasswordHash
+	}
+	passwordOK := auth.VerifyPasswordOrDummy(storedHash, req.Password)
+	if lookupErr != nil || !passwordOK {
 		writeError(w, http.StatusUnauthorized, "invalid_credentials")
 		return
 	}
@@ -162,6 +175,7 @@ func (a *API) login(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "session_create_failed")
 		return
 	}
+	a.Store.RecordAuditEvent(r.Context(), &record.AccountID, "session.login", map[string]string{"device_id": record.DeviceID})
 	writeJSON(w, http.StatusOK, map[string]interface{}{"token": token, "account_id": record.AccountID, "device_id": record.DeviceID, "role": record.Role})
 }
 
@@ -213,6 +227,7 @@ func (a *API) register(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "session_create_failed")
 		return
 	}
+	a.Store.RecordAuditEvent(r.Context(), &created.Account.ID, "account.registered", map[string]string{"device_id": created.Device.ID})
 	writeJSON(w, http.StatusCreated, map[string]interface{}{"account": created.Account, "device": created.Device, "token": token})
 }
 
@@ -230,11 +245,27 @@ func (a *API) createInvite(w http.ResponseWriter, r *http.Request, principal dom
 	if !decodeJSON(w, r, &req) {
 		return
 	}
+	if req.ExpiresAt != nil {
+		now := time.Now().UTC()
+		if !req.ExpiresAt.After(now) {
+			writeError(w, http.StatusBadRequest, "invalid_expires_at")
+			return
+		}
+		if req.ExpiresAt.Sub(now) > 90*24*time.Hour {
+			writeError(w, http.StatusBadRequest, "expires_at_too_far")
+			return
+		}
+	}
+	if req.MaxUses < 0 || req.MaxUses > 10000 {
+		writeError(w, http.StatusBadRequest, "invalid_max_uses")
+		return
+	}
 	invite, err := a.Store.CreateInvite(r.Context(), principal.AccountID, req.MaxUses, req.ExpiresAt)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "invite_create_failed")
 		return
 	}
+	a.Store.RecordAuditEvent(r.Context(), &principal.AccountID, "invite.created", map[string]interface{}{"invite_id": invite.ID, "max_uses": invite.MaxUses})
 	writeJSON(w, http.StatusCreated, invite)
 }
 
@@ -247,6 +278,128 @@ func (a *API) listDevices(w http.ResponseWriter, r *http.Request, principal doma
 	writeJSON(w, http.StatusOK, map[string]interface{}{"devices": devices})
 }
 
+type createDeviceLinkRequest struct {
+	ExpiresInSeconds int64 `json:"expires_in_seconds,omitempty"`
+}
+
+func (a *API) createDeviceLink(w http.ResponseWriter, r *http.Request, principal domain.Principal) {
+	if principal.DeviceID == "" {
+		writeError(w, http.StatusBadRequest, "device_session_required")
+		return
+	}
+	var req createDeviceLinkRequest
+	if !decodeOptionalJSON(w, r, &req) {
+		return
+	}
+	link, err := a.Store.CreateDeviceLink(r.Context(), principal.AccountID, principal.DeviceID, time.Duration(req.ExpiresInSeconds)*time.Second)
+	if err != nil {
+		handleStorageError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]interface{}{"device_link": deviceLinkPayload(link)})
+}
+
+type claimDeviceLinkRequest struct {
+	Code             string `json:"code"`
+	DeviceName       string `json:"device_name"`
+	DeviceKeyPackage []byte `json:"device_key_package"`
+	SigningKey       []byte `json:"signing_key,omitempty"`
+}
+
+func (a *API) claimDeviceLink(w http.ResponseWriter, r *http.Request) {
+	var req claimDeviceLinkRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	claimToken, claimTokenHash, err := auth.NewToken()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "claim_token_create_failed")
+		return
+	}
+	link, err := a.Store.ClaimDeviceLink(r.Context(), req.Code, req.DeviceName, req.DeviceKeyPackage, req.SigningKey, claimTokenHash)
+	if err != nil {
+		if errors.Is(err, storage.ErrDeviceLinkInvalid) {
+			writeError(w, http.StatusBadRequest, "invalid_device_link")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "device_link_claim_failed")
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]interface{}{"device_link": deviceLinkPayload(link), "claim_token": claimToken})
+}
+
+func (a *API) deviceLinkSubroute(w http.ResponseWriter, r *http.Request) {
+	parts := strings.Split(strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/v1/device-links/"), "/"), "/")
+	if len(parts) == 1 && parts[0] != "" && r.Method == http.MethodGet {
+		principal, err := a.principalFromRequest(r)
+		if err != nil {
+			writeError(w, http.StatusUnauthorized, "unauthorized")
+			return
+		}
+		link, err := a.Store.DeviceLinkForAccount(r.Context(), parts[0], principal.AccountID)
+		if err != nil {
+			handleStorageError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{"device_link": deviceLinkPayload(link)})
+		return
+	}
+	if len(parts) != 2 {
+		writeError(w, http.StatusNotFound, "not_found")
+		return
+	}
+	linkID := parts[0]
+	switch {
+	case parts[1] == "approve" && r.Method == http.MethodPost:
+		principal, err := a.principalFromRequest(r)
+		if err != nil {
+			writeError(w, http.StatusUnauthorized, "unauthorized")
+			return
+		}
+		link, device, err := a.Store.ApproveDeviceLink(r.Context(), linkID, principal.AccountID)
+		if err != nil {
+			if errors.Is(err, storage.ErrDeviceLinkInvalid) {
+				writeError(w, http.StatusBadRequest, "invalid_device_link")
+				return
+			}
+			handleStorageError(w, err)
+			return
+		}
+		payload := map[string]interface{}{"device": device, "device_link_id": link.ID}
+		eventID, _ := a.Store.SaveSyncEvent(r.Context(), "device.updated", &principal.AccountID, "", payload)
+		a.Hub.Publish([]string{principal.AccountID}, realtime.Event{Version: "v1", Type: "device.updated", ID: eventID, Payload: payload, CreatedAt: time.Now().UTC()})
+		a.Store.RecordAuditEvent(r.Context(), &principal.AccountID, "device_link.approved", map[string]string{"link_id": link.ID, "device_id": device.ID})
+		writeJSON(w, http.StatusOK, map[string]interface{}{"device_link": deviceLinkPayload(link), "device": device})
+	case parts[1] == "claim-status" && r.Method == http.MethodGet:
+		// The claim token is sent via header to keep it out of access logs.
+		claimToken := strings.TrimSpace(r.Header.Get("X-Veritra-Claim-Token"))
+		if claimToken == "" {
+			writeError(w, http.StatusBadRequest, "claim_token_required")
+			return
+		}
+		sessionToken, sessionTokenHash, err := auth.NewToken()
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "token_create_failed")
+			return
+		}
+		linked, err := a.Store.ConsumeApprovedDeviceLink(r.Context(), linkID, auth.HashToken(claimToken), sessionTokenHash, time.Now().UTC().Add(30*24*time.Hour))
+		if err != nil {
+			switch {
+			case errors.Is(err, storage.ErrDeviceLinkNotReady):
+				writeJSON(w, http.StatusAccepted, map[string]string{"state": "pending_approval"})
+			case errors.Is(err, storage.ErrDeviceLinkInvalid):
+				writeError(w, http.StatusBadRequest, "invalid_device_link")
+			default:
+				writeError(w, http.StatusInternalServerError, "device_link_status_failed")
+			}
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{"account": linked.Account, "device": linked.Device, "token": sessionToken})
+	default:
+		writeError(w, http.StatusNotFound, "not_found")
+	}
+}
+
 type createCommunityRequest struct {
 	Name string `json:"name"`
 }
@@ -254,6 +407,10 @@ type createCommunityRequest struct {
 func (a *API) createCommunity(w http.ResponseWriter, r *http.Request, principal domain.Principal) {
 	var req createCommunityRequest
 	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if !validDisplayName(req.Name) {
+		writeError(w, http.StatusBadRequest, "invalid_name")
 		return
 	}
 	community, err := a.Store.CreateCommunity(r.Context(), req.Name, principal.AccountID)
@@ -272,6 +429,10 @@ func (a *API) communitySubroute(w http.ResponseWriter, r *http.Request, principa
 			Kind string `json:"kind"`
 		}
 		if !decodeJSON(w, r, &req) {
+			return
+		}
+		if !validDisplayName(req.Name) {
+			writeError(w, http.StatusBadRequest, "invalid_name")
 			return
 		}
 		channel, err := a.Store.CreateChannel(r.Context(), parts[0], req.Name, req.Kind, principal.AccountID)
@@ -301,6 +462,10 @@ func (a *API) createConversation(w http.ResponseWriter, r *http.Request, princip
 	}
 	if req.Kind != "dm" && req.Kind != "group" && req.Kind != "community_channel" {
 		writeError(w, http.StatusBadRequest, "invalid_conversation_kind")
+		return
+	}
+	if !validRetention(req.RetentionSeconds) {
+		writeError(w, http.StatusBadRequest, "invalid_retention_seconds")
 		return
 	}
 	conversation, err := a.Store.CreateConversation(r.Context(), storage.CreateConversationInput{
@@ -344,15 +509,6 @@ func (a *API) conversationSubroute(w http.ResponseWriter, r *http.Request, princ
 	conversationID := parts[0]
 	switch {
 	case parts[1] == "members" && r.Method == http.MethodPost:
-		canManage, err := a.canManageConversation(r.Context(), conversationID, principal)
-		if err != nil {
-			handleStorageError(w, err)
-			return
-		}
-		if !canManage {
-			writeError(w, http.StatusForbidden, "forbidden")
-			return
-		}
 		var req struct {
 			AccountID string `json:"account_id"`
 			Role      string `json:"role"`
@@ -360,10 +516,36 @@ func (a *API) conversationSubroute(w http.ResponseWriter, r *http.Request, princ
 		if !decodeJSON(w, r, &req) {
 			return
 		}
-		if err := a.Store.AddConversationMember(r.Context(), conversationID, req.AccountID, req.Role); err != nil {
-			writeError(w, http.StatusInternalServerError, "member_add_failed")
+		if req.AccountID == "" {
+			writeError(w, http.StatusBadRequest, "account_id_required")
 			return
 		}
+		if req.Role == "" {
+			req.Role = domain.RoleMember
+		}
+		if !domain.ValidRole(req.Role) {
+			writeError(w, http.StatusBadRequest, "invalid_role")
+			return
+		}
+		effectiveRole, err := a.effectiveConversationRole(r.Context(), conversationID, principal)
+		if err != nil {
+			handleStorageError(w, err)
+			return
+		}
+		if !domain.CanManageMembers(effectiveRole) {
+			writeError(w, http.StatusForbidden, "forbidden")
+			return
+		}
+		// A user cannot grant a role higher than their own effective role.
+		if domain.RoleRank(req.Role) > domain.RoleRank(effectiveRole) {
+			writeError(w, http.StatusForbidden, "cannot_grant_higher_role")
+			return
+		}
+		if err := a.Store.AddConversationMember(r.Context(), conversationID, req.AccountID, req.Role); err != nil {
+			handleStorageError(w, err)
+			return
+		}
+		a.Store.RecordAuditEvent(r.Context(), &principal.AccountID, "conversation.member.added", map[string]string{"conversation_id": conversationID, "target_account_id": req.AccountID, "role": req.Role})
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	case parts[1] == "messages" && r.Method == http.MethodGet:
 		limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
@@ -408,11 +590,20 @@ func (a *API) conversationSubroute(w http.ResponseWriter, r *http.Request, princ
 		if !decodeJSON(w, r, &req) {
 			return
 		}
+		if !validRetention(req.RetentionSeconds) {
+			writeError(w, http.StatusBadRequest, "invalid_retention_seconds")
+			return
+		}
 		conversation, err := a.Store.UpdateConversationRetention(r.Context(), conversationID, principal.AccountID, req.RetentionSeconds)
 		if err != nil {
 			handleStorageError(w, err)
 			return
 		}
+		retentionMeta := map[string]interface{}{"conversation_id": conversationID}
+		if req.RetentionSeconds != nil {
+			retentionMeta["retention_seconds"] = *req.RetentionSeconds
+		}
+		a.Store.RecordAuditEvent(r.Context(), &principal.AccountID, "conversation.retention.updated", retentionMeta)
 		eventID, _ := a.Store.SaveSyncEvent(r.Context(), "retention.updated", nil, conversationID, conversation)
 		members, _ := a.Store.ListConversationMemberIDs(r.Context(), conversationID)
 		a.Hub.Publish(members, realtime.Event{Version: "v1", Type: "retention.updated", ID: eventID, ConversationID: conversationID, Payload: conversation, CreatedAt: time.Now().UTC()})
@@ -455,6 +646,10 @@ func (a *API) createMessageEnvelope(w http.ResponseWriter, r *http.Request, prin
 		writeError(w, http.StatusBadRequest, "invalid_encrypted_envelope")
 		return
 	}
+	if len(req.IdempotencyKey) > 128 || len(req.CryptoProtocol) > 64 {
+		writeError(w, http.StatusBadRequest, "invalid_encrypted_envelope")
+		return
+	}
 	envelope, duplicate, err := a.Store.SaveMessageEnvelope(r.Context(), domain.MessageEnvelope{
 		ConversationID:  req.ConversationID,
 		SenderAccountID: principal.AccountID,
@@ -472,7 +667,8 @@ func (a *API) createMessageEnvelope(w http.ResponseWriter, r *http.Request, prin
 		handleStorageError(w, err)
 		return
 	}
-	eventID, _ := a.Store.SaveSyncEvent(r.Context(), "message.envelope.created", nil, envelope.ConversationID, envelope)
+	ref := messageEventRef(envelope)
+	eventID, _ := a.Store.SaveSyncEvent(r.Context(), "message.envelope.created", nil, envelope.ConversationID, ref)
 	members, _ := a.Store.ListConversationMemberIDs(r.Context(), envelope.ConversationID)
 	a.Hub.Publish(members, realtime.Event{Version: "v1", Type: "message.envelope.created", ID: eventID, ConversationID: envelope.ConversationID, Payload: envelope, CreatedAt: time.Now().UTC()})
 	status := http.StatusCreated
@@ -579,9 +775,27 @@ func decodeEncryptedMutation(w http.ResponseWriter, r *http.Request) (encryptedM
 }
 
 func (a *API) publishMessageEvent(r *http.Request, eventType string, envelope domain.MessageEnvelope) {
-	eventID, _ := a.Store.SaveSyncEvent(r.Context(), eventType, nil, envelope.ConversationID, envelope)
+	ref := messageEventRef(envelope)
+	eventID, _ := a.Store.SaveSyncEvent(r.Context(), eventType, nil, envelope.ConversationID, ref)
 	members, _ := a.Store.ListConversationMemberIDs(r.Context(), envelope.ConversationID)
 	a.Hub.Publish(members, realtime.Event{Version: "v1", Type: eventType, ID: eventID, ConversationID: envelope.ConversationID, Payload: envelope, CreatedAt: time.Now().UTC()})
+}
+
+// messageEventRef is the compact form persisted in sync_events.payload_json:
+// just the IDs the client needs to refetch the full envelope, never the
+// ciphertext. This keeps the audit/sync log from duplicating message bodies.
+func messageEventRef(envelope domain.MessageEnvelope) map[string]interface{} {
+	ref := map[string]interface{}{
+		"message_id":      envelope.ID,
+		"conversation_id": envelope.ConversationID,
+	}
+	if envelope.EditedAt != nil {
+		ref["edited_at"] = envelope.EditedAt
+	}
+	if envelope.DeletedAt != nil {
+		ref["deleted_at"] = envelope.DeletedAt
+	}
+	return ref
 }
 
 func (a *API) uploadAttachment(w http.ResponseWriter, r *http.Request, principal domain.Principal) {
@@ -674,6 +888,19 @@ func (a *API) createPushSubscription(w http.ResponseWriter, r *http.Request, pri
 	writeJSON(w, http.StatusCreated, map[string]string{"status": "ok", "payload_policy": "generic_encrypted_event_only"})
 }
 
+func (a *API) deletePushSubscription(w http.ResponseWriter, r *http.Request, principal domain.Principal) {
+	id := r.PathValue("id")
+	if strings.TrimSpace(id) == "" {
+		writeError(w, http.StatusBadRequest, "invalid_subscription_id")
+		return
+	}
+	if err := a.Store.DisablePushSubscription(r.Context(), id, principal.AccountID); err != nil {
+		handleStorageError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func (a *API) createCall(w http.ResponseWriter, r *http.Request, principal domain.Principal) {
 	var req struct {
 		ConversationID string          `json:"conversation_id"`
@@ -706,12 +933,23 @@ func (a *API) syncEvents(w http.ResponseWriter, r *http.Request, principal domai
 
 func (a *API) searchMetadata(w http.ResponseWriter, r *http.Request, principal domain.Principal) {
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
-	results, err := a.Store.SearchMetadata(r.Context(), principal.AccountID, r.URL.Query().Get("q"), limit)
+	offset, _ := strconv.Atoi(r.URL.Query().Get("offset"))
+	results, err := a.Store.SearchMetadata(r.Context(), principal.AccountID, r.URL.Query().Get("q"), limit, offset)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "search_failed")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]interface{}{"results": results})
+	normalizedLimit := normalizeLimit(limit, 20, 50)
+	normalizedOffset := normalizeOffset(offset)
+	response := map[string]interface{}{
+		"results": results,
+		"limit":   normalizedLimit,
+		"offset":  normalizedOffset,
+	}
+	if len(results) == normalizedLimit {
+		response["next_offset"] = normalizedOffset + len(results)
+	}
+	writeJSON(w, http.StatusOK, response)
 }
 
 func (a *API) exportAccount(w http.ResponseWriter, r *http.Request, principal domain.Principal) {
@@ -728,6 +966,7 @@ func (a *API) deleteAccount(w http.ResponseWriter, r *http.Request, principal do
 		handleStorageError(w, err)
 		return
 	}
+	a.Store.RecordAuditEvent(r.Context(), &principal.AccountID, "account.deleted", nil)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -755,25 +994,27 @@ func (a *API) withAuth(next authedHandler) http.HandlerFunc {
 }
 
 func (a *API) principalFromRequest(r *http.Request) (domain.Principal, error) {
-	token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-	if token == "" {
-		token = r.URL.Query().Get("token")
+	authz := r.Header.Get("Authorization")
+	const scheme = "Bearer "
+	if len(authz) < len(scheme) || !strings.EqualFold(authz[:len(scheme)], scheme) {
+		return domain.Principal{}, storage.ErrUnauthorized
 	}
+	token := strings.TrimSpace(authz[len(scheme):])
 	if token == "" {
 		return domain.Principal{}, storage.ErrUnauthorized
 	}
 	return a.Store.PrincipalByTokenHash(r.Context(), auth.HashToken(token))
 }
 
-func (a *API) canManageConversation(ctx context.Context, conversationID string, principal domain.Principal) (bool, error) {
-	if domain.CanManageMembers(principal.Role) {
-		return true, nil
+func (a *API) effectiveConversationRole(ctx context.Context, conversationID string, principal domain.Principal) (string, error) {
+	convRole, err := a.Store.ConversationMemberRole(ctx, conversationID, principal.AccountID)
+	if err != nil && !errors.Is(err, storage.ErrNotMember) {
+		return "", err
 	}
-	role, err := a.Store.ConversationMemberRole(ctx, conversationID, principal.AccountID)
-	if err != nil {
-		return false, err
+	if domain.RoleRank(principal.Role) > domain.RoleRank(convRole) {
+		return principal.Role, nil
 	}
-	return domain.CanManageMembers(role), nil
+	return convRole, nil
 }
 
 func readLimitedJSON(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
@@ -794,6 +1035,19 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, dest interface{}) bool {
 	raw, ok := readLimitedJSON(w, r)
 	if !ok {
 		return false
+	}
+	return decodeRawJSON(w, raw, dest)
+}
+
+func decodeOptionalJSON(w http.ResponseWriter, r *http.Request, dest interface{}) bool {
+	defer r.Body.Close()
+	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 1<<20))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_body")
+		return false
+	}
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return true
 	}
 	return decodeRawJSON(w, raw, dest)
 }
@@ -851,12 +1105,66 @@ func optionalQuery(r *http.Request, name string) *string {
 	return &value
 }
 
+func normalizeLimit(value, fallback, max int) int {
+	if value <= 0 || value > max {
+		return fallback
+	}
+	return value
+}
+
+func normalizeOffset(value int) int {
+	if value < 0 {
+		return 0
+	}
+	return value
+}
+
+// validRetention bounds the retention window to [0, 10 years]. A nil pointer
+// (no retention) is allowed.
+func validRetention(seconds *int64) bool {
+	if seconds == nil {
+		return true
+	}
+	const tenYears int64 = 10 * 365 * 24 * 60 * 60
+	return *seconds >= 0 && *seconds <= tenYears
+}
+
+func validDisplayName(name string) bool {
+	trimmed := strings.TrimSpace(name)
+	return trimmed != "" && len(trimmed) <= 64
+}
+
+func deviceLinkPayload(link domain.DeviceLink) map[string]interface{} {
+	payload := map[string]interface{}{
+		"id":                link.ID,
+		"state":             link.State,
+		"verification_code": link.VerificationCode,
+		"created_at":        link.CreatedAt,
+		"expires_at":        link.ExpiresAt,
+	}
+	if link.Code != "" {
+		payload["code"] = link.Code
+		payload["link_uri"] = "veritra://device-link?code=" + url.QueryEscape(link.Code)
+	}
+	if link.ClaimedDeviceName != nil {
+		payload["claimed_device_name"] = *link.ClaimedDeviceName
+	}
+	if link.ApprovedDeviceID != nil {
+		payload["approved_device_id"] = *link.ApprovedDeviceID
+	}
+	return payload
+}
+
 func handleStorageError(w http.ResponseWriter, err error) {
 	switch {
+	case errors.Is(err, storage.ErrUnauthorized):
+		writeError(w, http.StatusUnauthorized, "unauthorized")
 	case errors.Is(err, storage.ErrNotMember), errors.Is(err, storage.ErrForbidden):
 		writeError(w, http.StatusForbidden, "forbidden")
 	case errors.Is(err, storage.ErrNotFound):
 		writeError(w, http.StatusNotFound, "not_found")
+	case errors.Is(err, storage.ErrDeviceLinkInvalid):
+		writeError(w, http.StatusBadRequest, "invalid_device_link")
 	default:
 		writeError(w, http.StatusInternalServerError, "storage_error")
 	}

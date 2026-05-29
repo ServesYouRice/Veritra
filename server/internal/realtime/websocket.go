@@ -10,16 +10,25 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
+	"time"
 )
 
-const websocketGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+const (
+	websocketGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+	maxFrameSize  = 1 << 20 // 1 MiB per inbound client frame
+)
 
 func ServeWebSocket(w http.ResponseWriter, r *http.Request, client *Client, unregister func()) error {
 	defer unregister()
 	if !strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
 		http.Error(w, "websocket upgrade required", http.StatusUpgradeRequired)
 		return errors.New("websocket upgrade required")
+	}
+	if !originAllowed(r) {
+		http.Error(w, "origin not allowed", http.StatusForbidden)
+		return errors.New("origin not allowed")
 	}
 	key := r.Header.Get("Sec-WebSocket-Key")
 	if key == "" {
@@ -36,6 +45,8 @@ func ServeWebSocket(w http.ResponseWriter, r *http.Request, client *Client, unre
 		return err
 	}
 	defer conn.Close()
+	// Clear http.Server read/write deadlines for the long-lived connection.
+	_ = conn.SetDeadline(time.Time{})
 
 	accept := websocketAccept(key)
 	if _, err := fmt.Fprintf(rw, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n\r\n", accept); err != nil {
@@ -65,6 +76,19 @@ func ServeWebSocket(w http.ResponseWriter, r *http.Request, client *Client, unre
 			return r.Context().Err()
 		}
 	}
+}
+
+func originAllowed(r *http.Request) bool {
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	if origin == "" {
+		// Non-browser clients (mobile/desktop) omit Origin; accept.
+		return true
+	}
+	originURL, err := url.Parse(origin)
+	if err != nil || originURL.Host == "" {
+		return false
+	}
+	return strings.EqualFold(originURL.Host, r.Host)
 }
 
 func websocketAccept(key string) string {
@@ -105,6 +129,10 @@ func drainClientFrames(conn net.Conn, done chan<- struct{}) {
 		}
 		opcode := first & 0x0f
 		masked := second&0x80 != 0
+		// RFC 6455 §5.1: client frames MUST be masked. Close on violation.
+		if !masked {
+			return
+		}
 		length := int64(second & 0x7f)
 		switch length {
 		case 126:
@@ -120,11 +148,12 @@ func drainClientFrames(conn net.Conn, done chan<- struct{}) {
 			}
 			length = int64(binary.BigEndian.Uint64(buf[:]))
 		}
-		if masked {
-			var mask [4]byte
-			if _, err := io.ReadFull(reader, mask[:]); err != nil {
-				return
-			}
+		if length < 0 || length > maxFrameSize {
+			return
+		}
+		var mask [4]byte
+		if _, err := io.ReadFull(reader, mask[:]); err != nil {
+			return
 		}
 		if length > 0 {
 			if _, err := io.CopyN(io.Discard, reader, length); err != nil {

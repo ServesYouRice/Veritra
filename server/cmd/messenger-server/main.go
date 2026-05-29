@@ -66,7 +66,7 @@ func run(args []string, stdout, stderr io.Writer) error {
 	case "doctor":
 		return doctor(ctx, cfg, stdout)
 	case "backup":
-		return backup(cfg, fs.Args(), stdout)
+		return backup(ctx, cfg, fs.Args(), stdout)
 	case "restore":
 		return restore(cfg, fs.Args(), stdout)
 	case "help", "-h", "--help":
@@ -131,7 +131,7 @@ func doctor(ctx context.Context, cfg config.Config, stdout io.Writer) error {
 	return nil
 }
 
-func backup(cfg config.Config, args []string, stdout io.Writer) error {
+func backup(ctx context.Context, cfg config.Config, args []string, stdout io.Writer) error {
 	out := filepath.Join(cfg.DataDir, "backups", "private-messenger-"+time.Now().UTC().Format("20060102T150405Z")+".db")
 	if len(args) > 0 {
 		out = args[0]
@@ -139,7 +139,15 @@ func backup(cfg config.Config, args []string, stdout io.Writer) error {
 	if err := os.MkdirAll(filepath.Dir(out), 0o700); err != nil {
 		return err
 	}
-	if err := copyFile(cfg.DatabasePath, out, 0o600); err != nil {
+	store, err := storage.Open(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	if err := store.BackupTo(ctx, out); err != nil {
+		return err
+	}
+	if err := os.Chmod(out, 0o600); err != nil {
 		return err
 	}
 	fmt.Fprintf(stdout, "database backup written: %s\n", out)
@@ -151,7 +159,28 @@ func restore(cfg config.Config, args []string, stdout io.Writer) error {
 	if len(args) != 1 {
 		return errors.New("restore requires path to a database backup")
 	}
-	if err := copyFile(args[0], cfg.DatabasePath, 0o600); err != nil {
+	src := args[0]
+	if _, err := os.Stat(src); err != nil {
+		return fmt.Errorf("backup not readable: %w", err)
+	}
+	// Refuse if a server appears to be running against this DB. Acquiring an
+	// exclusive open on the WAL companion is a cheap probe: if a running
+	// server holds it, OpenFile will fail with ERROR_SHARING_VIOLATION on
+	// Windows or the file will be missing harmlessly on a stopped server.
+	walPath := cfg.DatabasePath + "-wal"
+	if probe, err := os.OpenFile(walPath, os.O_RDWR, 0); err == nil {
+		_ = probe.Close()
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("database appears in use (could not lock %s): %w; stop the server first", walPath, err)
+	}
+	// Remove the live DB and any -wal / -shm companions to prevent SQLite
+	// from misreading a stale WAL against the freshly restored main file.
+	for _, leftover := range []string{cfg.DatabasePath, walPath, cfg.DatabasePath + "-shm"} {
+		if err := os.Remove(leftover); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("remove %s: %w", leftover, err)
+		}
+	}
+	if err := copyFile(src, cfg.DatabasePath, 0o600); err != nil {
 		return err
 	}
 	fmt.Fprintf(stdout, "database restored to: %s\n", cfg.DatabasePath)

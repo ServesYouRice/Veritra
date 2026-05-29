@@ -172,6 +172,13 @@ func TestMetadataSearchBackupExportAndAccountDelete(t *testing.T) {
 	if !bytes.Contains(response, []byte(`"type":"account"`)) {
 		t.Fatalf("search did not include account metadata: %s", response)
 	}
+	status, response = doJSON(t, handler, http.MethodGet, "/api/v1/search/metadata?q=owner&limit=1&offset=0", token, nil)
+	if status != http.StatusOK {
+		t.Fatalf("paginated search status=%d body=%s", status, response)
+	}
+	if !bytes.Contains(response, []byte(`"limit":1`)) || !bytes.Contains(response, []byte(`"offset":0`)) || !bytes.Contains(response, []byte(`"next_offset":1`)) {
+		t.Fatalf("paginated search missing pagination metadata: %s", response)
+	}
 	status, response = doJSON(t, handler, http.MethodGet, "/api/v1/search/metadata?q=SEARCH_ONLY_CIPHERTEXT", token, nil)
 	if status != http.StatusOK {
 		t.Fatalf("ciphertext search status=%d body=%s", status, response)
@@ -203,6 +210,99 @@ func TestMetadataSearchBackupExportAndAccountDelete(t *testing.T) {
 	status, _ = doJSON(t, handler, http.MethodGet, "/api/v1/conversations", token, nil)
 	if status != http.StatusUnauthorized {
 		t.Fatalf("deleted account token status=%d want %d", status, http.StatusUnauthorized)
+	}
+}
+
+func TestDeviceLinkingFlowRequiresExistingDeviceApproval(t *testing.T) {
+	handler, ownerToken, _ := newTestHandlerWithOwner(t)
+
+	status, response := doJSON(t, handler, http.MethodPost, "/api/v1/device-links", ownerToken, map[string]interface{}{})
+	if status != http.StatusCreated {
+		t.Fatalf("create device link status=%d body=%s", status, response)
+	}
+	var created struct {
+		DeviceLink struct {
+			ID               string `json:"id"`
+			Code             string `json:"code"`
+			State            string `json:"state"`
+			VerificationCode string `json:"verification_code"`
+		} `json:"device_link"`
+	}
+	if err := json.Unmarshal(response, &created); err != nil {
+		t.Fatalf("decode device link: %v", err)
+	}
+	if created.DeviceLink.ID == "" || created.DeviceLink.Code == "" || created.DeviceLink.VerificationCode == "" {
+		t.Fatalf("created link missing fields: %s", response)
+	}
+
+	status, response = doJSON(t, handler, http.MethodPost, "/api/v1/device-links/claim", "", map[string]interface{}{
+		"code":               created.DeviceLink.Code,
+		"device_name":        "linked tablet",
+		"device_key_package": base64.StdEncoding.EncodeToString([]byte("tablet-key-package")),
+		"signing_key":        base64.StdEncoding.EncodeToString([]byte("tablet-signing-key")),
+	})
+	if status != http.StatusAccepted {
+		t.Fatalf("claim device link status=%d body=%s", status, response)
+	}
+	var claimed struct {
+		ClaimToken string `json:"claim_token"`
+		DeviceLink struct {
+			State            string `json:"state"`
+			VerificationCode string `json:"verification_code"`
+		} `json:"device_link"`
+	}
+	if err := json.Unmarshal(response, &claimed); err != nil {
+		t.Fatalf("decode claimed device link: %v", err)
+	}
+	if claimed.ClaimToken == "" || claimed.DeviceLink.State != "claimed" || claimed.DeviceLink.VerificationCode != created.DeviceLink.VerificationCode {
+		t.Fatalf("unexpected claimed response: %s", response)
+	}
+
+	status, response = doJSON(t, handler, http.MethodGet, "/api/v1/device-links/"+created.DeviceLink.ID, ownerToken, nil)
+	if status != http.StatusOK {
+		t.Fatalf("device link status=%d body=%s", status, response)
+	}
+	if !bytes.Contains(response, []byte(`"claimed_device_name":"linked tablet"`)) {
+		t.Fatalf("device link status missing claimed device: %s", response)
+	}
+
+	status, response = doRaw(t, handler, http.MethodGet, "/api/v1/device-links/"+created.DeviceLink.ID+"/claim-status", "", nil, map[string]string{
+		"X-Veritra-Claim-Token": claimed.ClaimToken,
+	})
+	if status != http.StatusAccepted {
+		t.Fatalf("pre-approval claim status=%d body=%s", status, response)
+	}
+
+	status, response = doJSON(t, handler, http.MethodPost, "/api/v1/device-links/"+created.DeviceLink.ID+"/approve", ownerToken, nil)
+	if status != http.StatusOK {
+		t.Fatalf("approve device link status=%d body=%s", status, response)
+	}
+	if !bytes.Contains(response, []byte(`"device"`)) {
+		t.Fatalf("approve response missing device: %s", response)
+	}
+
+	status, response = doRaw(t, handler, http.MethodGet, "/api/v1/device-links/"+created.DeviceLink.ID+"/claim-status", "", nil, map[string]string{
+		"X-Veritra-Claim-Token": claimed.ClaimToken,
+	})
+	if status != http.StatusOK {
+		t.Fatalf("approved claim status=%d body=%s", status, response)
+	}
+	var completed struct {
+		Token  string `json:"token"`
+		Device struct {
+			ID   string `json:"id"`
+			Name string `json:"name"`
+		} `json:"device"`
+	}
+	if err := json.Unmarshal(response, &completed); err != nil {
+		t.Fatalf("decode completed link: %v", err)
+	}
+	if completed.Token == "" || completed.Device.ID == "" || completed.Device.Name != "linked tablet" {
+		t.Fatalf("unexpected completed link: %s", response)
+	}
+	status, response = doJSON(t, handler, http.MethodGet, "/api/v1/devices/me", completed.Token, nil)
+	if status != http.StatusOK || !bytes.Contains(response, []byte("linked tablet")) {
+		t.Fatalf("linked token devices status=%d body=%s", status, response)
 	}
 }
 

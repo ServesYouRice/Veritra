@@ -68,6 +68,48 @@ class MetadataSearchResult {
   }
 }
 
+class DeviceLink {
+  DeviceLink({
+    required this.id,
+    required this.state,
+    required this.verificationCode,
+    required this.expiresAt,
+    this.code,
+    this.linkUri,
+    this.claimedDeviceName,
+    this.approvedDeviceId,
+  });
+
+  final String id;
+  final String state;
+  final String verificationCode;
+  final DateTime expiresAt;
+  final String? code;
+  final String? linkUri;
+  final String? claimedDeviceName;
+  final String? approvedDeviceId;
+
+  factory DeviceLink.fromJson(Map<String, Object?> json) {
+    return DeviceLink(
+      id: json['id'] as String,
+      state: json['state'] as String,
+      verificationCode: json['verification_code'] as String,
+      expiresAt: DateTime.parse(json['expires_at'] as String),
+      code: json['code'] as String?,
+      linkUri: json['link_uri'] as String?,
+      claimedDeviceName: json['claimed_device_name'] as String?,
+      approvedDeviceId: json['approved_device_id'] as String?,
+    );
+  }
+}
+
+class DeviceLinkClaim {
+  DeviceLinkClaim({required this.deviceLink, required this.claimToken});
+
+  final DeviceLink deviceLink;
+  final String claimToken;
+}
+
 class Session {
   const Session({required this.baseUrl, required this.token});
 

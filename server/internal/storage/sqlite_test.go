@@ -189,7 +189,7 @@ func TestMessageMarkersSyncSearchExportAndMembershipGuards(t *testing.T) {
 	if len(events) != 1 || events[0].ID != eventID {
 		t.Fatalf("unexpected sync events: %#v", events)
 	}
-	results, err := store.SearchMetadata(ctx, owner.Account.ID, "owner", 10)
+	results, err := store.SearchMetadata(ctx, owner.Account.ID, "owner", 10, 0)
 	if err != nil {
 		t.Fatalf("metadata search: %v", err)
 	}
@@ -211,6 +211,62 @@ func TestMessageMarkersSyncSearchExportAndMembershipGuards(t *testing.T) {
 	}
 }
 
+func TestMetadataSearchRanksAndPaginatesAllowedLabelsOnly(t *testing.T) {
+	ctx := context.Background()
+	store, _ := newTestStore(t, ctx)
+	defer store.Close()
+	owner := createTestOwner(t, ctx, store)
+
+	alphaCommunity, err := store.CreateCommunity(ctx, "Alpha", owner.Account.ID)
+	if err != nil {
+		t.Fatalf("create alpha community: %v", err)
+	}
+	if _, err := store.CreateChannel(ctx, alphaCommunity.ID, "Alpine", "private", owner.Account.ID); err != nil {
+		t.Fatalf("create alpine channel: %v", err)
+	}
+	if _, err := store.CreateCommunity(ctx, "Team Alpha", owner.Account.ID); err != nil {
+		t.Fatalf("create team alpha community: %v", err)
+	}
+
+	firstPage, err := store.SearchMetadata(ctx, owner.Account.ID, "alpha", 2, 0)
+	if err != nil {
+		t.Fatalf("first page metadata search: %v", err)
+	}
+	if len(firstPage) != 2 {
+		t.Fatalf("first page len=%d want 2: %#v", len(firstPage), firstPage)
+	}
+	if firstPage[0].Type != "community" || firstPage[0].Label != "Alpha" {
+		t.Fatalf("exact match should rank first: %#v", firstPage)
+	}
+	if firstPage[1].Label != "Team Alpha" {
+		t.Fatalf("contains match should be second for this fixture: %#v", firstPage)
+	}
+
+	secondPage, err := store.SearchMetadata(ctx, owner.Account.ID, "alpha", 2, 2)
+	if err != nil {
+		t.Fatalf("second page metadata search: %v", err)
+	}
+	if len(secondPage) != 0 {
+		t.Fatalf("unexpected second page results: %#v", secondPage)
+	}
+
+	prefixResults, err := store.SearchMetadata(ctx, owner.Account.ID, "alp", 10, 0)
+	if err != nil {
+		t.Fatalf("prefix metadata search: %v", err)
+	}
+	if len(prefixResults) < 2 || prefixResults[0].Label != "Alpha" || prefixResults[1].Label != "Alpine" {
+		t.Fatalf("prefix results not ranked by label: %#v", prefixResults)
+	}
+
+	ciphertextResults, err := store.SearchMetadata(ctx, owner.Account.ID, "ciphertext", 10, 0)
+	if err != nil {
+		t.Fatalf("ciphertext metadata search: %v", err)
+	}
+	if len(ciphertextResults) != 0 {
+		t.Fatalf("metadata search should not inspect messages: %#v", ciphertextResults)
+	}
+}
+
 func TestExpiredInviteCannotRegister(t *testing.T) {
 	ctx := context.Background()
 	store, _ := newTestStore(t, ctx)
@@ -225,6 +281,67 @@ func TestExpiredInviteCannotRegister(t *testing.T) {
 	_, err = store.RegisterWithInvite(ctx, RegisterInput{InviteCode: invite.Code, Username: "late", PasswordHash: hash, DeviceName: "phone", KeyPackage: []byte("key")})
 	if err == nil {
 		t.Fatal("expected expired invite registration to fail")
+	}
+}
+
+func TestDeviceLinkRequiresApprovalBeforeSession(t *testing.T) {
+	ctx := context.Background()
+	store, _ := newTestStore(t, ctx)
+	defer store.Close()
+	owner := createTestOwner(t, ctx, store)
+
+	link, err := store.CreateDeviceLink(ctx, owner.Account.ID, owner.Device.ID, time.Minute)
+	if err != nil {
+		t.Fatalf("create device link: %v", err)
+	}
+	claimToken, claimTokenHash, err := auth.NewToken()
+	if err != nil {
+		t.Fatalf("claim token: %v", err)
+	}
+	claimed, err := store.ClaimDeviceLink(ctx, link.Code, "Tablet", []byte("tablet-key-package"), []byte("tablet-signing-key"), claimTokenHash)
+	if err != nil {
+		t.Fatalf("claim device link: %v", err)
+	}
+	if claimed.State != domain.DeviceLinkClaimed || claimed.VerificationCode != link.VerificationCode {
+		t.Fatalf("unexpected claimed link: %#v", claimed)
+	}
+	_, sessionTokenHash, err := auth.NewToken()
+	if err != nil {
+		t.Fatalf("session token: %v", err)
+	}
+	if _, err := store.ConsumeApprovedDeviceLink(ctx, link.ID, auth.HashToken(claimToken), sessionTokenHash, time.Now().UTC().Add(time.Hour)); !errors.Is(err, ErrDeviceLinkNotReady) {
+		t.Fatalf("pre-approval consume err=%v want %v", err, ErrDeviceLinkNotReady)
+	}
+	approved, device, err := store.ApproveDeviceLink(ctx, link.ID, owner.Account.ID)
+	if err != nil {
+		t.Fatalf("approve device link: %v", err)
+	}
+	if approved.State != domain.DeviceLinkApproved || device.AccountID != owner.Account.ID || device.Name != "Tablet" {
+		t.Fatalf("unexpected approved device link: %#v %#v", approved, device)
+	}
+	if _, err := store.ConsumeApprovedDeviceLink(ctx, link.ID, auth.HashToken("wrong-claim-token"), sessionTokenHash, time.Now().UTC().Add(time.Hour)); !errors.Is(err, ErrDeviceLinkInvalid) {
+		t.Fatalf("wrong claim token err=%v want %v", err, ErrDeviceLinkInvalid)
+	}
+	linked, err := store.ConsumeApprovedDeviceLink(ctx, link.ID, auth.HashToken(claimToken), sessionTokenHash, time.Now().UTC().Add(time.Hour))
+	if err != nil {
+		t.Fatalf("consume approved device link: %v", err)
+	}
+	if linked.Account.ID != owner.Account.ID || linked.Device.ID != device.ID {
+		t.Fatalf("unexpected linked account/device: %#v", linked)
+	}
+	principal, err := store.PrincipalByTokenHash(ctx, sessionTokenHash)
+	if err != nil {
+		t.Fatalf("principal by linked token: %v", err)
+	}
+	if principal.AccountID != owner.Account.ID || principal.DeviceID != device.ID {
+		t.Fatalf("unexpected linked principal: %#v", principal)
+	}
+	secondToken, secondTokenHash, err := auth.NewToken()
+	if err != nil {
+		t.Fatalf("second session token: %v", err)
+	}
+	if _, err := store.ConsumeApprovedDeviceLink(ctx, link.ID, auth.HashToken(claimToken), secondTokenHash, time.Now().UTC().Add(time.Hour)); !errors.Is(err, ErrDeviceLinkInvalid) {
+		t.Fatalf("second consume with token %q err=%v want %v", secondToken, err, ErrDeviceLinkInvalid)
 	}
 }
 

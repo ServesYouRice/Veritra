@@ -14,6 +14,16 @@ Base path: `/api/v1`
 - `POST /api/v1/register` consumes an invite and creates account, device, and session.
 - `POST /api/v1/invites` creates invite codes for owner/admin users.
 
+## Device Linking
+
+- `POST /api/v1/device-links` creates a short-lived one-time QR/link code from an authenticated existing device.
+- `GET /api/v1/device-links/{id}` returns the authenticated account's current link state for approval UX.
+- `POST /api/v1/device-links/claim` lets the new device submit the code, device name, and public key package. It returns a claim token, but not a session.
+- `POST /api/v1/device-links/{id}/approve` must be called by an already authenticated device on the same account before the new device is trusted.
+- `GET /api/v1/device-links/{id}/claim-status?claim_token={token}` lets the new device poll for approval. Once approved, the server creates a device-scoped session and consumes the link.
+
+The verification code returned to both devices must be compared in the client UX before approval. The server stores only public device key-package metadata and never receives private keys.
+
 ## Messaging
 
 - `POST /api/v1/conversations` creates DMs, groups, or channel-backed conversations.
@@ -40,7 +50,7 @@ Attachment and backup contents are opaque ciphertext to the server.
 
 ## Search and Account Data
 
-- `GET /api/v1/search/metadata?q={query}` searches only account usernames, visible community names, and visible channel names.
+- `GET /api/v1/search/metadata?q={query}&limit={n}&offset={n}` searches only account usernames, visible community names, and visible channel names. Results are ranked exact match, then prefix match, then contains match; pagination metadata includes `limit`, `offset`, and optional `next_offset`.
 - `GET /api/v1/account/export` exports account metadata, devices, visible conversations, and encrypted message envelopes.
 - `DELETE /api/v1/account` soft-deletes the account, revokes devices, and removes sessions.
 

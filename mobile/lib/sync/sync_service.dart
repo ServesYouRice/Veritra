@@ -21,12 +21,17 @@ class WebSocketSyncService implements SyncService {
 
   @override
   Future<void> connect() async {
-    final uri = Uri.parse(baseUrl).replace(
-      scheme: Uri.parse(baseUrl).scheme == 'https' ? 'wss' : 'ws',
+    final base = Uri.parse(baseUrl);
+    final uri = base.replace(
+      scheme: base.scheme == 'https' ? 'wss' : 'ws',
       path: '/api/v1/sync/ws',
-      queryParameters: <String, String>{'token': token},
     );
-    _socket = await WebSocket.connect(uri.toString());
+    // Send the token via the Authorization header so it never lands in URLs,
+    // server access logs, or reverse-proxy logs.
+    _socket = await WebSocket.connect(
+      uri.toString(),
+      headers: <String, dynamic>{'Authorization': 'Bearer $token'},
+    );
     _socket!.listen((data) {
       if (data is String) {
         _controller.add(jsonDecode(data) as Map<String, Object?>);

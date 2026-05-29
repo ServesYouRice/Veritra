@@ -85,13 +85,89 @@ class ApiClient {
   }
 
   Future<List<MetadataSearchResult>> searchMetadata(
-      String token, String query) async {
-    final json = await _jsonRequest(
-        'GET', '/api/v1/search/metadata?q=${Uri.encodeQueryComponent(query)}',
-        token: token);
+    String token,
+    String query, {
+    int limit = 20,
+    int offset = 0,
+  }) async {
+    final queryParameters = <String, String>{
+      'q': query,
+      'limit': limit.toString(),
+      'offset': offset.toString(),
+    };
+    final path = Uri(path: '/api/v1/search/metadata', queryParameters: queryParameters).toString();
+    final json = await _jsonRequest('GET', path, token: token);
     final rows = (json['results'] as List<Object?>? ?? const <Object?>[])
         .cast<Map<String, Object?>>();
     return rows.map(MetadataSearchResult.fromJson).toList();
+  }
+
+  Future<DeviceLink> createDeviceLink(String token) async {
+    final json = await _jsonRequest(
+      'POST',
+      '/api/v1/device-links',
+      token: token,
+      body: <String, Object?>{},
+    );
+    return DeviceLink.fromJson(
+        Map<String, Object?>.from(json['device_link'] as Map));
+  }
+
+  Future<DeviceLink> deviceLink(String token, String linkId) async {
+    final json = await _jsonRequest(
+      'GET',
+      '/api/v1/device-links/$linkId',
+      token: token,
+    );
+    return DeviceLink.fromJson(
+        Map<String, Object?>.from(json['device_link'] as Map));
+  }
+
+  Future<DeviceLinkClaim> claimDeviceLink({
+    required String code,
+    required String deviceName,
+    required List<int> deviceKeyPackage,
+    List<int> signingKey = const <int>[],
+  }) async {
+    final json = await _jsonRequest(
+      'POST',
+      '/api/v1/device-links/claim',
+      body: <String, Object?>{
+        'code': code,
+        'device_name': deviceName,
+        'device_key_package': base64Encode(deviceKeyPackage),
+        if (signingKey.isNotEmpty) 'signing_key': base64Encode(signingKey),
+      },
+    );
+    return DeviceLinkClaim(
+      deviceLink: DeviceLink.fromJson(
+          Map<String, Object?>.from(json['device_link'] as Map)),
+      claimToken: json['claim_token'] as String,
+    );
+  }
+
+  Future<DeviceLink> approveDeviceLink(String token, String linkId) async {
+    final json = await _jsonRequest(
+      'POST',
+      '/api/v1/device-links/$linkId/approve',
+      token: token,
+    );
+    return DeviceLink.fromJson(
+        Map<String, Object?>.from(json['device_link'] as Map));
+  }
+
+  Future<Session?> completeDeviceLinkClaim(
+      String linkId, String claimToken) async {
+    final json = await _jsonRequest(
+      'GET',
+      '/api/v1/device-links/$linkId/claim-status',
+      extraHeaders: <String, String>{'X-Veritra-Claim-Token': claimToken},
+    );
+    final token = json['token'] as String?;
+    if (token == null) {
+      return null;
+    }
+    return Session(baseUrl: baseUrl, token: token);
   }
 
   Future<Map<String, Object?>> _jsonRequest(
@@ -100,6 +176,7 @@ class ApiClient {
     String? token,
     Map<String, Object?>? body,
     bool setupRequest = false,
+    Map<String, String> extraHeaders = const <String, String>{},
   }) async {
     final uri = Uri.parse(baseUrl).resolve(path);
     final request = await _httpClient.openUrl(method, uri);
@@ -110,6 +187,7 @@ class ApiClient {
     if (setupRequest) {
       request.headers.set('X-Private-Messenger-Setup', '1');
     }
+    extraHeaders.forEach((key, value) => request.headers.set(key, value));
     if (body != null) {
       request.write(jsonEncode(body));
     }

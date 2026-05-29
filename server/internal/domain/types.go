@@ -5,6 +5,8 @@ import (
 	"encoding/base32"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
+	"math/big"
 	"strings"
 	"time"
 )
@@ -14,6 +16,14 @@ const (
 	RoleAdmin     = "admin"
 	RoleModerator = "moderator"
 	RoleMember    = "member"
+)
+
+const (
+	DeviceLinkPending  = "pending"
+	DeviceLinkClaimed  = "claimed"
+	DeviceLinkApproved = "approved"
+	DeviceLinkConsumed = "consumed"
+	DeviceLinkRevoked  = "revoked"
 )
 
 type Principal struct {
@@ -42,6 +52,23 @@ type Device struct {
 	CreatedAt  time.Time  `json:"created_at"`
 	LastSeenAt *time.Time `json:"last_seen_at,omitempty"`
 	RevokedAt  *time.Time `json:"revoked_at,omitempty"`
+}
+
+type DeviceLink struct {
+	ID                string     `json:"id"`
+	Code              string     `json:"code,omitempty"`
+	AccountID         string     `json:"account_id,omitempty"`
+	CreatedByDeviceID string     `json:"created_by_device_id,omitempty"`
+	State             string     `json:"state"`
+	VerificationCode  string     `json:"verification_code"`
+	ClaimedDeviceName *string    `json:"claimed_device_name,omitempty"`
+	ApprovedDeviceID  *string    `json:"approved_device_id,omitempty"`
+	CreatedAt         time.Time  `json:"created_at"`
+	ExpiresAt         time.Time  `json:"expires_at"`
+	ClaimedAt         *time.Time `json:"claimed_at,omitempty"`
+	ApprovedAt        *time.Time `json:"approved_at,omitempty"`
+	ConsumedAt        *time.Time `json:"consumed_at,omitempty"`
+	RevokedAt         *time.Time `json:"revoked_at,omitempty"`
 }
 
 type Invite struct {
@@ -150,6 +177,25 @@ func CanManageMembers(role string) bool {
 	return role == RoleOwner || role == RoleAdmin || role == RoleModerator
 }
 
+func RoleRank(role string) int {
+	switch role {
+	case RoleOwner:
+		return 4
+	case RoleAdmin:
+		return 3
+	case RoleModerator:
+		return 2
+	case RoleMember:
+		return 1
+	default:
+		return 0
+	}
+}
+
+func ValidRole(role string) bool {
+	return RoleRank(role) > 0
+}
+
 func NewID(prefix string) (string, error) {
 	var b [16]byte
 	if _, err := rand.Read(b[:]); err != nil {
@@ -164,6 +210,14 @@ func NewInviteCode() (string, error) {
 		return "", err
 	}
 	return strings.TrimRight(base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(b), "="), nil
+}
+
+func NewVerificationCode() (string, error) {
+	n, err := rand.Int(rand.Reader, big.NewInt(1000000))
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%06d", n.Int64()), nil
 }
 
 func NormalizeUsername(username string) string {

@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
+	"sync"
 
 	"golang.org/x/crypto/bcrypt"
 )
@@ -24,6 +25,31 @@ func HashPassword(password string) (string, error) {
 }
 
 func VerifyPassword(hash, password string) bool {
+	return bcrypt.CompareHashAndPassword([]byte(hash), []byte(password)) == nil
+}
+
+var (
+	dummyHashOnce sync.Once
+	dummyHash     []byte
+)
+
+// VerifyPasswordOrDummy verifies password against hash. When hash is empty
+// (caller hit a non-existent account) it still performs a bcrypt comparison
+// against a fixed dummy hash so the response time matches the populated path,
+// closing a username-enumeration timing side-channel.
+func VerifyPasswordOrDummy(hash, password string) bool {
+	dummyHashOnce.Do(func() {
+		h, err := bcrypt.GenerateFromPassword([]byte("veritra-timing-dummy"), bcrypt.DefaultCost)
+		if err == nil {
+			dummyHash = h
+		}
+	})
+	if hash == "" {
+		if len(dummyHash) > 0 {
+			_ = bcrypt.CompareHashAndPassword(dummyHash, []byte(password))
+		}
+		return false
+	}
 	return bcrypt.CompareHashAndPassword([]byte(hash), []byte(password)) == nil
 }
 
