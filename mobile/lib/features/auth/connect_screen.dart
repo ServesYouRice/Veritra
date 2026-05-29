@@ -123,15 +123,89 @@ class _ConnectScreenState extends State<ConnectScreen> {
     );
   }
 
-  Future<void> _submit() {
+  Future<void> _submit() async {
+    final raw = url.text.trim();
+    if (!await _confirmInsecureUrl(raw)) {
+      return;
+    }
     switch (mode) {
     case AuthMode.owner:
-      return widget.state.createOwner(url.text.trim(), username.text.trim(), password.text);
+      return widget.state.createOwner(raw, username.text.trim(), password.text);
     case AuthMode.signIn:
-      return widget.state.login(url.text.trim(), username.text.trim(), password.text);
+      return widget.state.login(raw, username.text.trim(), password.text);
     case AuthMode.linkDevice:
-      return widget.state.claimDeviceLink(url.text.trim(), linkCode.text.trim());
+      return widget.state.claimDeviceLink(raw, linkCode.text.trim());
     }
+  }
+
+  /// Returns true if the URL is safe to use (HTTPS, or a clearly-local
+  /// HTTP target like localhost / 127.0.0.1 / *.local), or if the user
+  /// has explicitly confirmed an insecure public URL.
+  Future<bool> _confirmInsecureUrl(String raw) async {
+    if (raw.isEmpty) {
+      return true; // let downstream validation produce a clearer error
+    }
+    final parsed = Uri.tryParse(raw);
+    if (parsed == null || !parsed.hasScheme) {
+      return true;
+    }
+    if (parsed.scheme == 'https') {
+      return true;
+    }
+    if (parsed.scheme != 'http') {
+      return true;
+    }
+    final host = parsed.host.toLowerCase();
+    if (_isLocalHost(host)) {
+      return true;
+    }
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Use insecure connection?'),
+        content: Text(
+          'You are about to connect to $host over plain HTTP.\n\n'
+          'Your password, session token, and message metadata would be sent '
+          'in cleartext. Use https:// in production.',
+        ),
+        actions: <Widget>[
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(false),
+            child: const Text('Cancel'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(true),
+            child: const Text('Continue anyway'),
+          ),
+        ],
+      ),
+    );
+    return confirmed ?? false;
+  }
+
+  bool _isLocalHost(String host) {
+    if (host == 'localhost' || host == '127.0.0.1' || host == '::1') {
+      return true;
+    }
+    if (host.endsWith('.local') || host.endsWith('.localhost')) {
+      return true;
+    }
+    // RFC 1918 private ranges + loopback. Cheap string-prefix check; if the
+    // host is an FQDN that happens to start with "10." we still flag it as
+    // local, which is conservative for a dev convenience.
+    if (host.startsWith('10.') || host.startsWith('192.168.')) {
+      return true;
+    }
+    if (host.startsWith('172.')) {
+      final parts = host.split('.');
+      if (parts.length >= 2) {
+        final secondOctet = int.tryParse(parts[1]);
+        if (secondOctet != null && secondOctet >= 16 && secondOctet <= 31) {
+          return true;
+        }
+      }
+    }
+    return false;
   }
 
   Future<void> _completeDeviceLink() {

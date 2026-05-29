@@ -35,36 +35,7 @@ _All items in this tier are landed; see Done section below._
 
 ## Open — Tier 2: spec gaps the Plan already names
 
-These are documented as MVP work but unfinished. Larger than Tier 1 but
-still bounded.
-
-- [ ] **L. Login picks the oldest device when `device_id` is unspecified**
-  Session/audit attribution is wrong.
-  Fix: require `device_id`, or document that login without `device_id`
-  attaches to the canonical primary device.
-
-- [ ] **R. `ListMessages` has no cursor pagination (only LIMIT)**
-  Conversations past `limit` cannot be paged back.
-  Fix: add `before` / `after` query params (created_at + id tiebreaker).
-
-- [ ] **S. `ExportAccount` silently truncates at 1000 messages**
-  Privacy spec promises a full export.
-  Fix: paginate the export, or stream NDJSON.
-
-- [ ] **O. Mobile session is in-memory (`MemoryLocalStore`)**
-  Documented stub; users re-login on every cold start.
-  Fix: replace with `flutter_secure_storage`-backed implementation.
-
-- [ ] **P. Mobile doesn't warn on `http://` instance URLs**
-  Default is `http://localhost:8080` (fine for dev) but no confirmation
-  when a user types a public `http://…` URL.
-  Fix: confirmation dialog when the URL is non-HTTPS and host is not
-  `localhost` / RFC1918 / `.local`.
-
-- [ ] **Q. Push notifications toggle in Settings does nothing**
-  `SwitchListTile(value: false, onChanged: null, ...)`. Implies a feature
-  that isn't there.
-  Fix: hide until the push subscription API is wired up.
+_All items in this tier are landed; see Done section below._
 
 ---
 
@@ -104,6 +75,41 @@ still bounded.
 ---
 
 ## Done
+
+### 2026-05-29 — Tier 2 (spec gaps)
+- **L. Login device attribution.** When no `device_id` is provided,
+  `LoginRecord` now picks the most-recently-active device
+  (`COALESCE(last_seen_at, created_at) DESC`) instead of the oldest.
+  Combined with the `last_seen_at` stamping from Tier 1, login attaches
+  to the device a user actually used last.
+- **Q. Settings: hidden non-functional push toggle.** Replaced the dead
+  `SwitchListTile` with explicit "coming soon" disabled tiles for
+  Recovery / Calls / Privacy so the UI no longer implies features that
+  don't exist.
+- **R. `ListMessages` cursor pagination.** Added
+  `storage.ListMessagesOptions` (`Limit`, `BeforeID`, `AfterID`).
+  `GET /api/v1/conversations/{id}/messages` accepts `before`/`after`
+  query params and returns `next_before` when more older messages may
+  exist. Cursor is `(created_at, id)` so messages with identical
+  timestamps still page correctly. New `TestListMessagesCursorPagination`
+  walks three pages to verify the contract.
+- **S. `ExportAccount` paginated.** New `ExportAccountOptions` (Limit,
+  BeforeID), default 1000 with a cap of 5000. Endpoint surfaces
+  `next_before` when more messages exist so truncation is no longer
+  silent. Account, devices, and conversations are still returned in full
+  on every page; only messages paginate.
+- **P. Mobile insecure-URL confirmation.** `ConnectScreen._submit` now
+  shows a confirmation dialog when the user submits an `http://` URL
+  whose host is not local (`localhost`, `127.0.0.1`, `::1`, `*.local`,
+  `*.localhost`, RFC 1918 ranges). Cancel aborts the submission;
+  Continue Anyway proceeds.
+- **O. Encrypted local session store.** Added `flutter_secure_storage`
+  dependency and `SecureLocalStore` that persists the session as JSON to
+  the platform keystore (Android Keystore-backed EncryptedSharedPrefs,
+  iOS Keychain `first_unlock_this_device`). `main.dart` uses it by
+  default and calls `AppState.tryRestoreSession()` on cold start so the
+  user is no longer kicked out on every app launch. Tests continue to
+  use `MemoryLocalStore`.
 
 ### 2026-05-29 — Tier 1 hardening pass
 - **K. Bearer prefix case-insensitive.** `principalFromRequest` uses

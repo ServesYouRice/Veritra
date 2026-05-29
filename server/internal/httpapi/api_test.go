@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 
 	"private-messenger/server/internal/app"
@@ -303,6 +304,55 @@ func TestDeviceLinkingFlowRequiresExistingDeviceApproval(t *testing.T) {
 	status, response = doJSON(t, handler, http.MethodGet, "/api/v1/devices/me", completed.Token, nil)
 	if status != http.StatusOK || !bytes.Contains(response, []byte("linked tablet")) {
 		t.Fatalf("linked token devices status=%d body=%s", status, response)
+	}
+}
+
+func TestListMessagesCursorPagination(t *testing.T) {
+	handler, token, _ := newTestHandlerWithOwner(t)
+	conversationID := createConversation(t, handler, token)
+	var ids []string
+	for i := 0; i < 5; i++ {
+		ids = append(ids, createMessage(t, handler, token, conversationID, "page-"+strconv.Itoa(i), []byte("ciphertext")))
+	}
+	type pageT struct {
+		Messages   []struct{ ID string `json:"id"` } `json:"messages"`
+		NextBefore string                            `json:"next_before"`
+	}
+	fetch := func(t *testing.T, path string) pageT {
+		t.Helper()
+		status, response := doJSON(t, handler, http.MethodGet, path, token, nil)
+		if status != http.StatusOK {
+			t.Fatalf("%s status=%d body=%s", path, status, response)
+		}
+		var p pageT
+		if err := json.Unmarshal(response, &p); err != nil {
+			t.Fatalf("decode %s: %v body=%s", path, err, response)
+		}
+		return p
+	}
+	// page 1: newest 2 → ids[4], ids[3]; next_before should be ids[3]
+	page1 := fetch(t, "/api/v1/conversations/"+conversationID+"/messages?limit=2")
+	if len(page1.Messages) != 2 || page1.Messages[0].ID != ids[4] || page1.Messages[1].ID != ids[3] {
+		t.Fatalf("page 1 ordering wrong: %#v", page1.Messages)
+	}
+	if page1.NextBefore != ids[3] {
+		t.Fatalf("page 1 next_before=%q want %q", page1.NextBefore, ids[3])
+	}
+	// page 2 via the cursor: should give ids[2], ids[1]
+	page2 := fetch(t, "/api/v1/conversations/"+conversationID+"/messages?limit=2&before="+page1.NextBefore)
+	if len(page2.Messages) != 2 || page2.Messages[0].ID != ids[2] || page2.Messages[1].ID != ids[1] {
+		t.Fatalf("page 2 ordering wrong: %#v", page2.Messages)
+	}
+	if page2.NextBefore != ids[1] {
+		t.Fatalf("page 2 next_before=%q want %q", page2.NextBefore, ids[1])
+	}
+	// page 3: last item, no further cursor
+	page3 := fetch(t, "/api/v1/conversations/"+conversationID+"/messages?limit=2&before="+page2.NextBefore)
+	if len(page3.Messages) != 1 || page3.Messages[0].ID != ids[0] {
+		t.Fatalf("page 3 wrong: %#v", page3.Messages)
+	}
+	if page3.NextBefore != "" {
+		t.Fatalf("page 3 should not advertise more, got next_before=%q", page3.NextBefore)
 	}
 }
 

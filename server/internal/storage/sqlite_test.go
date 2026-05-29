@@ -74,7 +74,7 @@ func TestInviteDeviceAndEncryptedEnvelopeFlow(t *testing.T) {
 	if !duplicate || msg2.ID != msg.ID {
 		t.Fatalf("expected idempotent duplicate, got duplicate=%v id=%s want=%s", duplicate, msg2.ID, msg.ID)
 	}
-	messages, err := store.ListMessages(ctx, conversation.ID, member.Account.ID, 10)
+	messages, err := store.ListMessages(ctx, conversation.ID, member.Account.ID, ListMessagesOptions{Limit: 10})
 	if err != nil {
 		t.Fatalf("list messages: %v", err)
 	}
@@ -199,7 +199,7 @@ func TestMessageMarkersSyncSearchExportAndMembershipGuards(t *testing.T) {
 	if err := store.CreateBackupBlob(ctx, owner.Account.ID, owner.Device.ID, "backup_blob", 64, json.RawMessage(`{"kdf":"test"}`)); err != nil {
 		t.Fatalf("create backup blob: %v", err)
 	}
-	export, err := store.ExportAccount(ctx, owner.Account.ID)
+	export, err := store.ExportAccount(ctx, owner.Account.ID, ExportAccountOptions{})
 	if err != nil {
 		t.Fatalf("export account: %v", err)
 	}

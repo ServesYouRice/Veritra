@@ -548,13 +548,30 @@ func (a *API) conversationSubroute(w http.ResponseWriter, r *http.Request, princ
 		a.Store.RecordAuditEvent(r.Context(), &principal.AccountID, "conversation.member.added", map[string]string{"conversation_id": conversationID, "target_account_id": req.AccountID, "role": req.Role})
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	case parts[1] == "messages" && r.Method == http.MethodGet:
-		limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
-		messages, err := a.Store.ListMessages(r.Context(), conversationID, principal.AccountID, limit)
+		limit := normalizeLimit(messageQueryLimit(r), 100, 200)
+		before := strings.TrimSpace(r.URL.Query().Get("before"))
+		after := strings.TrimSpace(r.URL.Query().Get("after"))
+		if before != "" && after != "" {
+			writeError(w, http.StatusBadRequest, "before_and_after_exclusive")
+			return
+		}
+		messages, err := a.Store.ListMessages(r.Context(), conversationID, principal.AccountID, storage.ListMessagesOptions{
+			Limit:    limit,
+			BeforeID: before,
+			AfterID:  after,
+		})
 		if err != nil {
 			handleStorageError(w, err)
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]interface{}{"messages": messages})
+		response := map[string]interface{}{"messages": messages, "limit": limit}
+		// Hint that more older messages may exist; clients can re-query with
+		// before=<next_before> to page backward.
+		if len(messages) == limit && len(messages) > 0 {
+			oldest := messages[len(messages)-1]
+			response["next_before"] = oldest.ID
+		}
+		writeJSON(w, http.StatusOK, response)
 	case parts[1] == "typing" && r.Method == http.MethodPost:
 		members, err := a.Store.ListConversationMemberIDs(r.Context(), conversationID)
 		if err != nil {
@@ -953,12 +970,25 @@ func (a *API) searchMetadata(w http.ResponseWriter, r *http.Request, principal d
 }
 
 func (a *API) exportAccount(w http.ResponseWriter, r *http.Request, principal domain.Principal) {
-	export, err := a.Store.ExportAccount(r.Context(), principal.AccountID)
+	limit := normalizeLimit(messageQueryLimit(r), 1000, 5000)
+	before := strings.TrimSpace(r.URL.Query().Get("before"))
+	export, err := a.Store.ExportAccount(r.Context(), principal.AccountID, storage.ExportAccountOptions{Limit: limit, BeforeID: before})
 	if err != nil {
 		handleStorageError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, export)
+	response := map[string]interface{}{
+		"account":       export.Account,
+		"devices":       export.Devices,
+		"conversations": export.Conversations,
+		"messages":      export.Messages,
+		"limit":         limit,
+	}
+	// Surface truncation explicitly so the client knows there may be more.
+	if len(export.Messages) == limit && len(export.Messages) > 0 {
+		response["next_before"] = export.Messages[len(export.Messages)-1].ID
+	}
+	writeJSON(w, http.StatusOK, response)
 }
 
 func (a *API) deleteAccount(w http.ResponseWriter, r *http.Request, principal domain.Principal) {
@@ -1132,6 +1162,11 @@ func validRetention(seconds *int64) bool {
 func validDisplayName(name string) bool {
 	trimmed := strings.TrimSpace(name)
 	return trimmed != "" && len(trimmed) <= 64
+}
+
+func messageQueryLimit(r *http.Request) int {
+	v, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	return v
 }
 
 func deviceLinkPayload(link domain.DeviceLink) map[string]interface{} {

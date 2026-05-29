@@ -44,6 +44,29 @@ class AppState extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Best-effort hydration of a previously-stored session on cold start.
+  /// Failures are swallowed: a stale or unreadable session simply lands the
+  /// user on the connect screen rather than crashing the app.
+  Future<void> tryRestoreSession() async {
+    try {
+      final restored = await localStore.loadSession();
+      if (restored == null) {
+        return;
+      }
+      session = restored;
+      api = apiClientFactory(restored.baseUrl);
+      await refreshConversations();
+      _startSync();
+      notifyListeners();
+    } catch (_) {
+      // Couldn't restore — discard the (possibly stale) cached session so the
+      // user can authenticate fresh.
+      await localStore.clear();
+      session = null;
+      api = null;
+    }
+  }
+
   Future<void> createOwner(String baseUrl, String username, String password) async {
     await _run(() async {
       api = apiClientFactory(baseUrl);

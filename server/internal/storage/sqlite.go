@@ -277,11 +277,17 @@ func (s *Store) LoginRecord(ctx context.Context, username, deviceID string) (Log
 		}
 		return record, nil
 	}
+	// Without an explicit device_id, attribute the session to the
+	// most-recently-active device (last_seen_at DESC, falling back to
+	// created_at when last_seen_at is unset). This matches the user
+	// expectation "log me into my newest device", while still keeping the
+	// session tied to a specific concrete device for audit purposes.
 	err := s.db.QueryRowContext(ctx, `
 		SELECT a.id, a.username, a.password_hash, a.role, d.id
 		FROM accounts a JOIN devices d ON d.account_id = a.id
 		WHERE a.username = ? AND a.deleted_at IS NULL AND d.revoked_at IS NULL
-		ORDER BY d.created_at LIMIT 1`, username).
+		ORDER BY COALESCE(d.last_seen_at, d.created_at) DESC, d.created_at DESC
+		LIMIT 1`, username).
 		Scan(&record.AccountID, &record.Username, &record.PasswordHash, &record.Role, &record.DeviceID)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -918,7 +924,15 @@ func (s *Store) messageAfterOwnedMutation(ctx context.Context, messageID string,
 	return s.MessageByID(ctx, messageID)
 }
 
-func (s *Store) ListMessages(ctx context.Context, conversationID, accountID string, limit int) ([]domain.MessageEnvelope, error) {
+// ListMessagesOptions controls pagination for ListMessages. Only one of
+// BeforeID/AfterID may be set; both empty returns the most recent page.
+type ListMessagesOptions struct {
+	Limit    int
+	BeforeID string // returns messages strictly older than this message id
+	AfterID  string // returns messages strictly newer than this message id
+}
+
+func (s *Store) ListMessages(ctx context.Context, conversationID, accountID string, opts ListMessagesOptions) ([]domain.MessageEnvelope, error) {
 	member, err := s.IsConversationMember(ctx, conversationID, accountID)
 	if err != nil {
 		return nil, err
@@ -926,12 +940,49 @@ func (s *Store) ListMessages(ctx context.Context, conversationID, accountID stri
 	if !member {
 		return nil, ErrNotMember
 	}
+	limit := opts.Limit
 	if limit <= 0 || limit > 200 {
 		limit = 100
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT id, conversation_id, sender_account_id, sender_device_id, idempotency_key, ciphertext, crypto_protocol, crypto_metadata_json, attachment_refs_json, reply_to_id, thread_root_id, created_at, edited_at, deleted_at, expires_at FROM message_envelopes WHERE conversation_id = ? ORDER BY created_at DESC LIMIT ?`, conversationID, limit)
-	if err != nil {
-		return nil, err
+	if opts.BeforeID != "" && opts.AfterID != "" {
+		return nil, fmt.Errorf("before_id and after_id are mutually exclusive")
+	}
+	const cols = `id, conversation_id, sender_account_id, sender_device_id, idempotency_key, ciphertext, crypto_protocol, crypto_metadata_json, attachment_refs_json, reply_to_id, thread_root_id, created_at, edited_at, deleted_at, expires_at`
+	var (
+		rows *sql.Rows
+	)
+	switch {
+	case opts.BeforeID != "":
+		cursorAt, err := s.messageCursor(ctx, conversationID, opts.BeforeID)
+		if err != nil {
+			return nil, err
+		}
+		rows, err = s.db.QueryContext(ctx, `SELECT `+cols+` FROM message_envelopes
+			WHERE conversation_id = ? AND (created_at < ? OR (created_at = ? AND id < ?))
+			ORDER BY created_at DESC, id DESC LIMIT ?`,
+			conversationID, cursorAt, cursorAt, opts.BeforeID, limit)
+		if err != nil {
+			return nil, err
+		}
+	case opts.AfterID != "":
+		cursorAt, err := s.messageCursor(ctx, conversationID, opts.AfterID)
+		if err != nil {
+			return nil, err
+		}
+		rows, err = s.db.QueryContext(ctx, `SELECT `+cols+` FROM message_envelopes
+			WHERE conversation_id = ? AND (created_at > ? OR (created_at = ? AND id > ?))
+			ORDER BY created_at ASC, id ASC LIMIT ?`,
+			conversationID, cursorAt, cursorAt, opts.AfterID, limit)
+		if err != nil {
+			return nil, err
+		}
+	default:
+		rows, err = s.db.QueryContext(ctx, `SELECT `+cols+` FROM message_envelopes
+			WHERE conversation_id = ?
+			ORDER BY created_at DESC, id DESC LIMIT ?`, conversationID, limit)
+		if err != nil {
+			return nil, err
+		}
 	}
 	defer rows.Close()
 	var messages []domain.MessageEnvelope
@@ -943,6 +994,21 @@ func (s *Store) ListMessages(ctx context.Context, conversationID, accountID stri
 		messages = append(messages, msg)
 	}
 	return messages, rows.Err()
+}
+
+// messageCursor returns the created_at of a message in a conversation, or
+// ErrNotFound if the message does not exist or belongs to a different
+// conversation. Used to validate before/after cursors.
+func (s *Store) messageCursor(ctx context.Context, conversationID, messageID string) (string, error) {
+	var createdAt string
+	err := s.db.QueryRowContext(ctx, `SELECT created_at FROM message_envelopes WHERE id = ? AND conversation_id = ?`, messageID, conversationID).Scan(&createdAt)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", ErrNotFound
+		}
+		return "", err
+	}
+	return createdAt, nil
 }
 
 // PruneSyncEvents deletes sync events older than the cutoff. Returns the
@@ -1226,7 +1292,19 @@ func (s *Store) CreateBackupBlob(ctx context.Context, accountID, deviceID, stora
 	return err
 }
 
-func (s *Store) ExportAccount(ctx context.Context, accountID string) (domain.AccountExport, error) {
+// ExportAccountOptions controls pagination of the message portion of an
+// account export. Account, devices, and conversations are always returned in
+// full; only messages are paginated.
+type ExportAccountOptions struct {
+	Limit    int
+	BeforeID string
+}
+
+// ExportAccount returns the caller's account, devices, conversations, and a
+// page of messages ordered newest-first. When opts.Limit is hit, the caller
+// must paginate using opts.BeforeID with the id of the oldest message in the
+// returned page. This replaces the prior silent 1000-message cap.
+func (s *Store) ExportAccount(ctx context.Context, accountID string, opts ExportAccountOptions) (domain.AccountExport, error) {
 	account, err := s.accountByID(ctx, accountID)
 	if err != nil {
 		return domain.AccountExport{}, err
@@ -1239,7 +1317,11 @@ func (s *Store) ExportAccount(ctx context.Context, accountID string) (domain.Acc
 	if err != nil {
 		return domain.AccountExport{}, err
 	}
-	messages, err := s.listVisibleMessagesForExport(ctx, accountID)
+	limit := opts.Limit
+	if limit <= 0 || limit > 5000 {
+		limit = 1000
+	}
+	messages, err := s.listVisibleMessagesForExport(ctx, accountID, opts.BeforeID, limit)
 	if err != nil {
 		return domain.AccountExport{}, err
 	}
@@ -1290,14 +1372,39 @@ func (s *Store) accountByID(ctx context.Context, accountID string) (domain.Accou
 	return account, nil
 }
 
-func (s *Store) listVisibleMessagesForExport(ctx context.Context, accountID string) ([]domain.MessageEnvelope, error) {
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT me.id, me.conversation_id, me.sender_account_id, me.sender_device_id, me.idempotency_key, me.ciphertext, me.crypto_protocol, me.crypto_metadata_json, me.attachment_refs_json, me.reply_to_id, me.thread_root_id, me.created_at, me.edited_at, me.deleted_at, me.expires_at
-		FROM message_envelopes me
-		JOIN memberships m ON m.conversation_id = me.conversation_id
-		WHERE m.account_id = ?
-		ORDER BY me.created_at DESC
-		LIMIT 1000`, accountID)
+func (s *Store) listVisibleMessagesForExport(ctx context.Context, accountID, beforeID string, limit int) ([]domain.MessageEnvelope, error) {
+	const cols = `me.id, me.conversation_id, me.sender_account_id, me.sender_device_id, me.idempotency_key, me.ciphertext, me.crypto_protocol, me.crypto_metadata_json, me.attachment_refs_json, me.reply_to_id, me.thread_root_id, me.created_at, me.edited_at, me.deleted_at, me.expires_at`
+	var rows *sql.Rows
+	var err error
+	if beforeID != "" {
+		var cursorAt string
+		err = s.db.QueryRowContext(ctx, `
+			SELECT me.created_at FROM message_envelopes me
+			JOIN memberships m ON m.conversation_id = me.conversation_id
+			WHERE m.account_id = ? AND me.id = ?`, accountID, beforeID).Scan(&cursorAt)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return nil, ErrNotFound
+			}
+			return nil, err
+		}
+		rows, err = s.db.QueryContext(ctx, `
+			SELECT `+cols+`
+			FROM message_envelopes me
+			JOIN memberships m ON m.conversation_id = me.conversation_id
+			WHERE m.account_id = ?
+			  AND (me.created_at < ? OR (me.created_at = ? AND me.id < ?))
+			ORDER BY me.created_at DESC, me.id DESC
+			LIMIT ?`, accountID, cursorAt, cursorAt, beforeID, limit)
+	} else {
+		rows, err = s.db.QueryContext(ctx, `
+			SELECT `+cols+`
+			FROM message_envelopes me
+			JOIN memberships m ON m.conversation_id = me.conversation_id
+			WHERE m.account_id = ?
+			ORDER BY me.created_at DESC, me.id DESC
+			LIMIT ?`, accountID, limit)
+	}
 	if err != nil {
 		return nil, err
 	}

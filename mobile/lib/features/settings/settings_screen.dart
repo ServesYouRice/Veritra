@@ -14,12 +14,6 @@ class SettingsScreen extends StatelessWidget {
       appBar: AppBar(title: const Text('Settings')),
       body: ListView(
         children: <Widget>[
-          const SwitchListTile(
-            value: false,
-            onChanged: null,
-            secondary: Icon(Icons.notifications_outlined),
-            title: Text('Push notifications'),
-          ),
           ListTile(
             leading: const Icon(Icons.qr_code_2),
             title: const Text('Link device'),
@@ -31,17 +25,26 @@ class SettingsScreen extends StatelessWidget {
               );
             },
           ),
+          // Placeholder entries point at planned screens; do not surface
+          // controls that have no implementation behind them yet
+          // (avoids implying a feature exists when it does not).
           const ListTile(
             leading: Icon(Icons.key_outlined),
             title: Text('Recovery'),
+            subtitle: Text('Encrypted backup & recovery key (coming soon)'),
+            enabled: false,
           ),
           const ListTile(
             leading: Icon(Icons.video_call_outlined),
             title: Text('Calls'),
+            subtitle: Text('1:1 audio/video (coming soon)'),
+            enabled: false,
           ),
           const ListTile(
             leading: Icon(Icons.privacy_tip_outlined),
             title: Text('Privacy'),
+            subtitle: Text('Configurable retention & visibility (coming soon)'),
+            enabled: false,
           ),
         ],
       ),
