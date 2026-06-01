@@ -9,7 +9,17 @@ services:
     volumes:
       - messenger-data:/data
     ports:
-      - "8080:8080"
+      # Plain HTTP is bound to loopback only so it is never exposed to the
+      # network without TLS. For production, run the `caddy` profile
+      # (`docker compose --profile caddy up`) which terminates HTTPS on 80/443
+      # and reverse-proxies to this service over the internal network.
+      - "127.0.0.1:8080:8080"
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/messenger-server", "healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
     restart: unless-stopped
 
   caddy:

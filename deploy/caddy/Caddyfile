@@ -1,12 +1,18 @@
 {
+	# REPLACE: ACME contact email used for Let's Encrypt certificate notices.
 	email admin@example.com
 }
 
+# REPLACE messenger.example.com with your real domain. Caddy provisions and
+# renews the TLS certificate automatically and terminates TLS here, so HSTS is
+# set at this edge — the app only emits HSTS when it terminates TLS itself,
+# which it does not when running behind this proxy.
 messenger.example.com {
 	reverse_proxy messenger:8080
 	header {
 		Referrer-Policy "no-referrer"
 		X-Content-Type-Options "nosniff"
+		Strict-Transport-Security "max-age=63072000; includeSubDomains"
 	}
 }
 

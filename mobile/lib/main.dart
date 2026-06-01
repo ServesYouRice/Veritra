@@ -13,7 +13,8 @@ Future<void> main() async {
     apiClientFactory: (baseUrl) => ApiClient(baseUrl: baseUrl),
     cryptoService: UnavailableCryptoService(),
     localStore: SecureLocalStore(),
-    syncServiceFactory: (baseUrl, token) => WebSocketSyncService(baseUrl: baseUrl, token: token),
+    syncServiceFactory: (baseUrl, token) =>
+        WebSocketSyncService(baseUrl: baseUrl, token: token),
   );
   // Best-effort: restore a previously stored session so the user doesn't have
   // to re-authenticate on every cold start. If the call fails (corrupt
@@ -36,7 +37,8 @@ class PrivateMessengerApp extends StatelessWidget {
         return MaterialApp(
           title: 'Private Messenger',
           theme: ThemeData(
-            colorScheme: ColorScheme.fromSeed(seedColor: const Color(0xff126f7a)),
+            colorScheme:
+                ColorScheme.fromSeed(seedColor: const Color(0xff126f7a)),
             useMaterial3: true,
           ),
           home: AppShell(state: state),
@@ -45,4 +47,3 @@ class PrivateMessengerApp extends StatelessWidget {
     );
   }
 }
-

@@ -78,6 +78,19 @@ func TestMessageAPIAcceptsCiphertextEnvelope(t *testing.T) {
 	}
 }
 
+func TestJSONDecodeRejectsTrailingDocument(t *testing.T) {
+	handler, token, _ := newTestHandlerWithOwner(t)
+	status, response := doRaw(t, handler, http.MethodPost, "/api/v1/conversations", token, []byte(`{"kind":"group"}{"kind":"group"}`), map[string]string{
+		"Content-Type": "application/json",
+	})
+	if status != http.StatusBadRequest {
+		t.Fatalf("status=%d body=%s", status, response)
+	}
+	if !bytes.Contains(response, []byte("invalid_json")) {
+		t.Fatalf("response missing invalid_json: %s", response)
+	}
+}
+
 func TestMessageLifecycleAndSyncRoutes(t *testing.T) {
 	handler, token, _ := newTestHandlerWithOwner(t)
 	conversationID := createConversation(t, handler, token)
@@ -214,6 +227,89 @@ func TestMetadataSearchBackupExportAndAccountDelete(t *testing.T) {
 	}
 }
 
+func TestAttachmentInvalidMetadataDoesNotWriteBlob(t *testing.T) {
+	handler, token, dbPath := newTestHandlerWithOwner(t)
+	blobDir := filepath.Join(filepath.Dir(dbPath), "blobs")
+	status, response := doRaw(t, handler, http.MethodPost, "/api/v1/attachments", token, []byte("encrypted attachment"), map[string]string{
+		"X-Private-Messenger-Encrypted": "1",
+		"X-Crypto-Metadata":             "{",
+	})
+	if status != http.StatusBadRequest {
+		t.Fatalf("attachment status=%d body=%s", status, response)
+	}
+	entries, err := os.ReadDir(blobDir)
+	if err != nil {
+		t.Fatalf("read blob dir: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("invalid attachment metadata wrote blobs: %#v", entries)
+	}
+}
+
+func TestPasswordLoginRequiresExplicitDeviceID(t *testing.T) {
+	handler, _, _ := newTestHandlerWithOwner(t)
+	status, response := doJSON(t, handler, http.MethodPost, "/api/v1/auth/login", "", map[string]interface{}{
+		"username": "owner",
+		"password": "owner-password-123",
+	})
+	if status != http.StatusBadRequest {
+		t.Fatalf("login status=%d body=%s", status, response)
+	}
+	if !bytes.Contains(response, []byte("device_id_required")) {
+		t.Fatalf("login response missing device_id_required: %s", response)
+	}
+}
+
+func TestLogoutAndDeviceRevocationInvalidateSessions(t *testing.T) {
+	handler, token, deviceID := newTestHandlerWithOwnerDevice(t)
+	status, response := doJSON(t, handler, http.MethodPost, "/api/v1/auth/logout", token, map[string]interface{}{})
+	if status != http.StatusNoContent {
+		t.Fatalf("logout status=%d body=%s", status, response)
+	}
+	status, _ = doJSON(t, handler, http.MethodGet, "/api/v1/conversations", token, nil)
+	if status != http.StatusUnauthorized {
+		t.Fatalf("logged-out token status=%d want %d", status, http.StatusUnauthorized)
+	}
+
+	handler, token, deviceID = newTestHandlerWithOwnerDevice(t)
+	status, response = doJSON(t, handler, http.MethodDelete, "/api/v1/devices/"+deviceID, token, nil)
+	if status != http.StatusNoContent {
+		t.Fatalf("revoke status=%d body=%s", status, response)
+	}
+	status, _ = doJSON(t, handler, http.MethodGet, "/api/v1/conversations", token, nil)
+	if status != http.StatusUnauthorized {
+		t.Fatalf("revoked-device token status=%d want %d", status, http.StatusUnauthorized)
+	}
+}
+
+func TestSetupRejectsNonProductionKeyPackage(t *testing.T) {
+	dir := t.TempDir()
+	application, err := app.New(context.Background(), config.Config{
+		Addr:         ":0",
+		DataDir:      dir,
+		DatabasePath: filepath.Join(dir, "private-messenger.db"),
+		StoragePath:  filepath.Join(dir, "blobs"),
+		InstanceName: "Test Messenger",
+	}, nil)
+	if err != nil {
+		t.Fatalf("new app: %v", err)
+	}
+	t.Cleanup(func() { _ = application.Close() })
+	status, response := doJSON(t, application.Handler(), http.MethodPost, "/api/v1/setup/owner", "", map[string]interface{}{
+		"instance_name":      "Test Messenger",
+		"username":           "owner",
+		"password":           "owner-password-123",
+		"device_name":        "setup browser",
+		"device_key_package": base64.StdEncoding.EncodeToString([]byte("setup-non-production-key-package-placeholder")),
+	})
+	if status != http.StatusBadRequest {
+		t.Fatalf("setup status=%d body=%s", status, response)
+	}
+	if !bytes.Contains(response, []byte("non_production_device_key_package")) {
+		t.Fatalf("setup response missing non_production_device_key_package: %s", response)
+	}
+}
+
 func TestDeviceLinkingFlowRequiresExistingDeviceApproval(t *testing.T) {
 	handler, ownerToken, _ := newTestHandlerWithOwner(t)
 
@@ -274,7 +370,9 @@ func TestDeviceLinkingFlowRequiresExistingDeviceApproval(t *testing.T) {
 		t.Fatalf("pre-approval claim status=%d body=%s", status, response)
 	}
 
-	status, response = doJSON(t, handler, http.MethodPost, "/api/v1/device-links/"+created.DeviceLink.ID+"/approve", ownerToken, nil)
+	status, response = doJSON(t, handler, http.MethodPost, "/api/v1/device-links/"+created.DeviceLink.ID+"/approve", ownerToken, map[string]interface{}{
+		"verification_code": created.DeviceLink.VerificationCode,
+	})
 	if status != http.StatusOK {
 		t.Fatalf("approve device link status=%d body=%s", status, response)
 	}
@@ -391,6 +489,46 @@ func newTestHandlerWithOwner(t *testing.T) (http.Handler, string, string) {
 		t.Fatalf("decode setup response: %v", err)
 	}
 	return handler, decoded.Token, dbPath
+}
+
+func newTestHandlerWithOwnerDevice(t *testing.T) (http.Handler, string, string) {
+	t.Helper()
+	dir := t.TempDir()
+	application, err := app.New(context.Background(), config.Config{
+		Addr:         ":0",
+		DataDir:      dir,
+		DatabasePath: filepath.Join(dir, "private-messenger.db"),
+		StoragePath:  filepath.Join(dir, "blobs"),
+		InstanceName: "Test Messenger",
+	}, nil)
+	if err != nil {
+		t.Fatalf("new app: %v", err)
+	}
+	t.Cleanup(func() { _ = application.Close() })
+	handler := application.Handler()
+	status, response := doJSON(t, handler, http.MethodPost, "/api/v1/setup/owner", "", map[string]interface{}{
+		"instance_name":      "Test Messenger",
+		"username":           "owner",
+		"password":           "owner-password-123",
+		"device_name":        "owner phone",
+		"device_key_package": base64.StdEncoding.EncodeToString([]byte("owner-key-package")),
+	})
+	if status != http.StatusCreated {
+		t.Fatalf("setup owner status=%d body=%s", status, response)
+	}
+	var decoded struct {
+		Token  string `json:"token"`
+		Device struct {
+			ID string `json:"id"`
+		} `json:"device"`
+	}
+	if err := json.Unmarshal(response, &decoded); err != nil {
+		t.Fatalf("decode setup response: %v", err)
+	}
+	if decoded.Token == "" || decoded.Device.ID == "" {
+		t.Fatalf("setup response missing token/device: %s", response)
+	}
+	return handler, decoded.Token, decoded.Device.ID
 }
 
 func createConversation(t *testing.T, handler http.Handler, token string) string {

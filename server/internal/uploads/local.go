@@ -59,3 +59,14 @@ func (s *LocalStore) PutEncryptedBlob(ctx context.Context, r io.Reader) (storage
 func (s *LocalStore) Open(storageKey string) (*os.File, error) {
 	return os.Open(filepath.Join(s.root, filepath.Base(storageKey)))
 }
+
+func (s *LocalStore) Delete(ctx context.Context, storageKey string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	err := os.Remove(filepath.Join(s.root, filepath.Base(storageKey)))
+	if os.IsNotExist(err) {
+		return nil
+	}
+	return err
+}

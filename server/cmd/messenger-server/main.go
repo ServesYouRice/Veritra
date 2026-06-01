@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -32,7 +34,10 @@ func run(args []string, stdout, stderr io.Writer) error {
 		return nil
 	}
 	command := args[0]
-	cfg := config.Load()
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
 	fs := flag.NewFlagSet(command, flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	var dbPath string
@@ -65,6 +70,8 @@ func run(args []string, stdout, stderr io.Writer) error {
 		return migrate(ctx, cfg, stdout)
 	case "doctor":
 		return doctor(ctx, cfg, stdout)
+	case "healthcheck":
+		return healthcheck(cfg)
 	case "backup":
 		return backup(ctx, cfg, fs.Args(), stdout)
 	case "restore":
@@ -99,7 +106,7 @@ func initInstance(ctx context.Context, cfg config.Config, stdout io.Writer) erro
 	if err := migrate(ctx, cfg, io.Discard); err != nil {
 		return err
 	}
-	fmt.Fprintf(stdout, "initialized data directory: %s\nsetup URL: http://localhost%s/setup\n", cfg.DataDir, cfg.Addr)
+	fmt.Fprintf(stdout, "initialized data directory: %s\nsetup status URL: http://localhost%s/api/v1/setup/status\n", cfg.DataDir, cfg.Addr)
 	return nil
 }
 
@@ -127,7 +134,36 @@ func doctor(ctx context.Context, cfg config.Config, stdout io.Writer) error {
 	}
 	fmt.Fprintln(stdout, "storage: ok")
 	fmt.Fprintln(stdout, "telemetry: disabled")
+	if cfg.EnableMetrics {
+		fmt.Fprintln(stdout, "local metrics: /metrics")
+	} else {
+		fmt.Fprintln(stdout, "local metrics: disabled")
+	}
 	fmt.Fprintln(stdout, "message plaintext persistence: forbidden by schema/API")
+	return nil
+}
+
+// healthcheck probes the locally running server over HTTP and exits non-zero on
+// failure. It is intended as a container HEALTHCHECK: the distroless image ships
+// no shell or curl, so the server binary itself performs the probe.
+func healthcheck(cfg config.Config) error {
+	host, port, err := net.SplitHostPort(cfg.Addr)
+	if err != nil {
+		return fmt.Errorf("invalid addr %q: %w", cfg.Addr, err)
+	}
+	if host == "" || host == "0.0.0.0" || host == "::" {
+		host = "127.0.0.1"
+	}
+	url := "http://" + net.JoinHostPort(host, port) + "/healthz"
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("health check failed: status %d", resp.StatusCode)
+	}
 	return nil
 }
 
@@ -213,5 +249,5 @@ func copyFile(src, dst string, mode os.FileMode) error {
 
 func usage(w io.Writer) {
 	fmt.Fprintln(w, "Private Messenger server")
-	fmt.Fprintln(w, "commands: serve, init, migrate, backup, restore, doctor")
+	fmt.Fprintln(w, "commands: serve, init, migrate, backup, restore, doctor, healthcheck")
 }

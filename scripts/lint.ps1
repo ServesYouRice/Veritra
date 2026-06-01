@@ -11,8 +11,12 @@ if (Get-Command go -ErrorAction SilentlyContinue) {
   go vet ./...
   Pop-Location
 } else {
-  $GoLintCommand = 'gofmt -l . > /tmp/private-messenger-gofmt.txt && test ! -s /tmp/private-messenger-gofmt.txt && go vet ./...'
-  docker run --rm -v "${Root}:/workspace" -w /workspace/server golang:1.25 sh -c $GoLintCommand
+  $Formatted = docker run --rm -v "${Root}:/workspace" -w /workspace/server golang:1.25 gofmt -l .
+  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+  if ($Formatted) {
+    Write-Error "gofmt needed: $Formatted"
+  }
+  docker run --rm -v "${Root}:/workspace" -w /workspace/server golang:1.25 go vet ./...
   if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 }
 
@@ -31,9 +35,10 @@ if (Get-Command flutter -ErrorAction SilentlyContinue) {
   Push-Location (Join-Path $Root "mobile")
   flutter pub get
   flutter analyze
+  dart format --set-exit-if-changed .
   Pop-Location
 } else {
-  $FlutterLintCommand = 'flutter pub get && flutter analyze'
+  $FlutterLintCommand = 'flutter pub get && flutter analyze && dart format --set-exit-if-changed .'
   docker run --rm -v "${Root}:/workspace" -w /workspace/mobile ghcr.io/cirruslabs/flutter:stable sh -c $FlutterLintCommand
   if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 }

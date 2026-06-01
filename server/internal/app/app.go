@@ -1,11 +1,13 @@
 package app
 
 import (
+	"bufio"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
@@ -24,11 +26,13 @@ import (
 )
 
 type App struct {
-	Config config.Config
-	Store  *storage.Store
-	Hub    *realtime.Hub
-	Blobs  *uploads.LocalStore
-	Log    *slog.Logger
+	Config  config.Config
+	Store   *storage.Store
+	Hub     *realtime.Hub
+	Blobs   *uploads.LocalStore
+	limiter *rateLimiter
+	metrics *httpMetrics
+	Log     *slog.Logger
 }
 
 func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*App, error) {
@@ -48,15 +52,30 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*App, err
 		_ = store.Close()
 		return nil, err
 	}
-	return &App{Config: cfg, Store: store, Hub: realtime.NewHub(), Blobs: blobs, Log: logger}, nil
+	limiter, err := newRateLimiter(cfg.TrustedProxies, 240, 10)
+	if err != nil {
+		_ = store.Close()
+		return nil, err
+	}
+	return &App{
+		Config:  cfg,
+		Store:   store,
+		Hub:     realtime.NewHub(),
+		Blobs:   blobs,
+		limiter: limiter,
+		metrics: newHTTPMetrics(),
+		Log:     logger,
+	}, nil
 }
 
 func (a *App) Handler() http.Handler {
 	mux := http.NewServeMux()
+	if a.Config.EnableMetrics {
+		mux.HandleFunc("GET /metrics", a.metrics.handle)
+	}
 	api := &httpapi.API{Store: a.Store, Hub: a.Hub, Blobs: a.Blobs, Log: a.Log}
 	api.Register(mux)
-	limiter := newRateLimiter(a.Config.TrustedProxies, 240, 10)
-	return securityHeaders(limiter.middleware(mux))
+	return securityHeaders(a.requestLogger(a.limiter.middleware(mux)))
 }
 
 func (a *App) Serve(ctx context.Context) error {
@@ -75,6 +94,7 @@ func (a *App) Serve(ctx context.Context) error {
 		_ = server.Shutdown(shutdownCtx)
 	}()
 	go a.runRetentionSweeper(ctx)
+	go a.limiter.cleanupLoop(ctx)
 	a.Log.Info("server_starting", "addr", a.Config.Addr)
 	err := server.ListenAndServe()
 	if errors.Is(err, http.ErrServerClosed) {
@@ -83,9 +103,10 @@ func (a *App) Serve(ctx context.Context) error {
 	return err
 }
 
-// runRetentionSweeper periodically prunes sync_events and audit_events older
-// than the retention window. The window is 30 days by default and can be
-// overridden via PRIVATE_MESSENGER_SYNC_EVENT_RETENTION_DAYS.
+// runRetentionSweeper periodically prunes expired message envelopes plus
+// sync_events and audit_events older than the retention window. The event
+// window is 30 days by default and can be overridden via
+// PRIVATE_MESSENGER_SYNC_EVENT_RETENTION_DAYS.
 func (a *App) runRetentionSweeper(ctx context.Context) {
 	retention := 30 * 24 * time.Hour
 	if raw := os.Getenv("PRIVATE_MESSENGER_SYNC_EVENT_RETENTION_DAYS"); raw != "" {
@@ -96,6 +117,11 @@ func (a *App) runRetentionSweeper(ctx context.Context) {
 	ticker := time.NewTicker(6 * time.Hour)
 	defer ticker.Stop()
 	sweep := func() {
+		if removed, err := a.Store.PruneExpiredMessages(ctx, time.Now().UTC()); err != nil {
+			a.Log.Warn("expired_message_prune_failed", "err", err)
+		} else if removed > 0 {
+			a.Log.Info("expired_messages_pruned", "removed", removed)
+		}
 		cutoff := time.Now().UTC().Add(-retention)
 		if removed, err := a.Store.PruneSyncEvents(ctx, cutoff); err != nil {
 			a.Log.Warn("sync_event_prune_failed", "err", err)
@@ -142,6 +168,116 @@ func securityHeaders(next http.Handler) http.Handler {
 	})
 }
 
+func (a *App) requestLogger(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		requestID := newRequestID()
+		w.Header().Set("X-Request-ID", requestID)
+		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		next.ServeHTTP(rec, r)
+		a.metrics.record(rec.status)
+		a.Log.Info("http_request",
+			"request_id", requestID,
+			"method", r.Method,
+			"route", routeClass(r.URL.Path),
+			"status", rec.status,
+			"duration_ms", time.Since(start).Milliseconds(),
+		)
+	})
+}
+
+type httpMetrics struct {
+	mu          sync.Mutex
+	total       int64
+	statusClass map[string]int64
+}
+
+func newHTTPMetrics() *httpMetrics {
+	return &httpMetrics{statusClass: map[string]int64{}}
+}
+
+func (m *httpMetrics) record(status int) {
+	class := strconv.Itoa(status/100) + "xx"
+	m.mu.Lock()
+	m.total++
+	m.statusClass[class]++
+	m.mu.Unlock()
+}
+
+func (m *httpMetrics) handle(w http.ResponseWriter, r *http.Request) {
+	m.mu.Lock()
+	total := m.total
+	classes := make(map[string]int64, len(m.statusClass))
+	for class, count := range m.statusClass {
+		classes[class] = count
+	}
+	m.mu.Unlock()
+
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	_, _ = fmt.Fprint(w, "# TYPE veritra_http_requests_total counter\n")
+	_, _ = fmt.Fprintf(w, "veritra_http_requests_total %d\n", total)
+	_, _ = fmt.Fprint(w, "# TYPE veritra_http_responses_total counter\n")
+	for _, class := range []string{"1xx", "2xx", "3xx", "4xx", "5xx"} {
+		_, _ = fmt.Fprintf(w, "veritra_http_responses_total{status_class=%q} %d\n", class, classes[class])
+	}
+}
+
+func newRequestID() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "request-id-unavailable"
+	}
+	return hex.EncodeToString(b[:])
+}
+
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func (r *statusRecorder) WriteHeader(status int) {
+	r.status = status
+	r.ResponseWriter.WriteHeader(status)
+}
+
+func (r *statusRecorder) Unwrap() http.ResponseWriter {
+	return r.ResponseWriter
+}
+
+func (r *statusRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	hijacker, ok := r.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, errors.New("hijacking unsupported")
+	}
+	r.status = http.StatusSwitchingProtocols
+	return hijacker.Hijack()
+}
+
+func (r *statusRecorder) Flush() {
+	if flusher, ok := r.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
+func routeClass(path string) string {
+	switch {
+	case path == "/healthz", path == "/setup":
+		return path
+	case strings.HasPrefix(path, "/api/v1/conversations/"):
+		return "/api/v1/conversations/{id}"
+	case strings.HasPrefix(path, "/api/v1/messages/"):
+		return "/api/v1/messages/{id}"
+	case strings.HasPrefix(path, "/api/v1/device-links/"):
+		return "/api/v1/device-links/{id}"
+	case strings.HasPrefix(path, "/api/v1/communities/"):
+		return "/api/v1/communities/{id}"
+	case strings.HasPrefix(path, "/api/v1/push/subscriptions/"):
+		return "/api/v1/push/subscriptions/{id}"
+	default:
+		return path
+	}
+}
+
 type rateLimiter struct {
 	salt           [16]byte
 	trustedProxies []*net.IPNet
@@ -160,29 +296,35 @@ type bucket struct {
 
 const maxRateLimitEntries = 65536
 
-func newRateLimiter(trustedProxies []*net.IPNet, general, auth int) *rateLimiter {
+func newRateLimiter(trustedProxies []*net.IPNet, general, auth int) (*rateLimiter, error) {
 	rl := &rateLimiter{
 		trustedProxies: trustedProxies,
 		generalLimit:   general,
 		authLimit:      auth,
 		buckets:        map[string]*bucket{},
 	}
-	_, _ = rand.Read(rl.salt[:])
-	go rl.cleanupLoop()
-	return rl
+	if _, err := rand.Read(rl.salt[:]); err != nil {
+		return nil, err
+	}
+	return rl, nil
 }
 
-func (rl *rateLimiter) cleanupLoop() {
+func (rl *rateLimiter) cleanupLoop(ctx context.Context) {
 	ticker := time.NewTicker(time.Minute)
 	defer ticker.Stop()
-	for now := range ticker.C {
-		rl.mu.Lock()
-		for k, b := range rl.buckets {
-			if b.reset.Before(now) {
-				delete(rl.buckets, k)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-ticker.C:
+			rl.mu.Lock()
+			for k, b := range rl.buckets {
+				if b.reset.Before(now) {
+					delete(rl.buckets, k)
+				}
 			}
+			rl.mu.Unlock()
 		}
-		rl.mu.Unlock()
 	}
 }
 

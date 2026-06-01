@@ -27,15 +27,29 @@ class AppState extends ChangeNotifier {
   Session? session;
   ApiClient? api;
   SyncService? sync;
+  StreamSubscription<Map<String, Object?>>? _syncSubscription;
   List<Conversation> conversations = <Conversation>[];
+  List<Device> devices = <Device>[];
+  Map<String, List<ReceivedMessageEnvelope>> messagesByConversation =
+      <String, List<ReceivedMessageEnvelope>>{};
   String? selectedConversationId;
   DeviceLink? activeDeviceLink;
   DeviceLinkClaim? pendingDeviceLinkClaim;
   String? error;
   bool busy = false;
+  bool _catchingUpSync = false;
+  int _lastSyncEventId = 0;
 
   bool get connected => session != null;
-  Conversation? get selectedConversation => conversations.where((c) => c.id == selectedConversationId).firstOrNull;
+  Conversation? get selectedConversation =>
+      conversations.where((c) => c.id == selectedConversationId).firstOrNull;
+  List<ReceivedMessageEnvelope> get selectedMessages {
+    final id = selectedConversationId;
+    if (id == null) {
+      return const <ReceivedMessageEnvelope>[];
+    }
+    return messagesByConversation[id] ?? const <ReceivedMessageEnvelope>[];
+  }
 
   Future<void> connect(String baseUrl) async {
     api = apiClientFactory(baseUrl);
@@ -53,21 +67,30 @@ class AppState extends ChangeNotifier {
       if (restored == null) {
         return;
       }
+      if (restored.token.isEmpty) {
+        return;
+      }
       session = restored;
       api = apiClientFactory(restored.baseUrl);
+      _lastSyncEventId = await localStore.loadSyncCursor();
       await refreshConversations();
+      await refreshDevices();
       _startSync();
       notifyListeners();
     } catch (_) {
-      // Couldn't restore — discard the (possibly stale) cached session so the
-      // user can authenticate fresh.
-      await localStore.clear();
+      // Runtime state falls back to the connect screen; the cached device ID
+      // stays available for password login on an already-linked device.
       session = null;
       api = null;
+      devices = <Device>[];
+      messagesByConversation = <String, List<ReceivedMessageEnvelope>>{};
+      _lastSyncEventId = 0;
+      await localStore.saveSyncCursor(0);
     }
   }
 
-  Future<void> createOwner(String baseUrl, String username, String password) async {
+  Future<void> createOwner(
+      String baseUrl, String username, String password) async {
     await _run(() async {
       api = apiClientFactory(baseUrl);
       session = await api!.createOwner(
@@ -77,7 +100,10 @@ class AppState extends ChangeNotifier {
         deviceKeyPackage: await cryptoService.createDeviceKeyPackage(),
       );
       await localStore.saveSession(session!);
+      _lastSyncEventId = 0;
+      await localStore.saveSyncCursor(0);
       await refreshConversations();
+      await refreshDevices();
       _startSync();
     });
   }
@@ -85,21 +111,68 @@ class AppState extends ChangeNotifier {
   Future<void> login(String baseUrl, String username, String password) async {
     await _run(() async {
       api = apiClientFactory(baseUrl);
-      session = await api!.login(username: username, password: password);
+      final localSession = await localStore.loadSession();
+      final deviceId =
+          localSession?.baseUrl == baseUrl ? localSession?.deviceId : null;
+      if (deviceId == null || deviceId.isEmpty) {
+        throw StateError(
+            'Password login requires this device to be linked first.');
+      }
+      session = await api!.login(
+        username: username,
+        password: password,
+        deviceId: deviceId,
+      );
       await localStore.saveSession(session!);
+      _lastSyncEventId = 0;
+      await localStore.saveSyncCursor(0);
       await refreshConversations();
+      await refreshDevices();
       _startSync();
     });
   }
 
   Future<void> refreshConversations() async {
+    await _refreshConversations(notify: true);
+  }
+
+  Future<void> refreshDevices() async {
+    final current = session;
+    final client = api;
+    if (current == null || client == null) {
+      return;
+    }
+    devices = await client.devices(current.token);
+    notifyListeners();
+  }
+
+  Future<void> _refreshConversations({required bool notify}) async {
     final current = session;
     final client = api;
     if (current == null || client == null) {
       return;
     }
     conversations = await client.conversations(current.token);
-    notifyListeners();
+    if (notify) {
+      notifyListeners();
+    }
+  }
+
+  Future<void> refreshSelectedMessages({bool notify = true}) async {
+    final current = session;
+    final client = api;
+    final conversationId = selectedConversationId;
+    if (current == null || client == null || conversationId == null) {
+      return;
+    }
+    final messages = await client.listMessages(current.token, conversationId);
+    messagesByConversation = <String, List<ReceivedMessageEnvelope>>{
+      ...messagesByConversation,
+      conversationId: messages,
+    };
+    if (notify) {
+      notifyListeners();
+    }
   }
 
   Future<void> createGroup() async {
@@ -109,9 +182,11 @@ class AppState extends ChangeNotifier {
       if (current == null || client == null) {
         return;
       }
-      final conversation = await client.createConversation(current.token, 'group');
+      final conversation =
+          await client.createConversation(current.token, 'group');
       conversations = <Conversation>[conversation, ...conversations];
       selectedConversationId = conversation.id;
+      messagesByConversation[conversation.id] = <ReceivedMessageEnvelope>[];
     });
   }
 
@@ -125,6 +200,7 @@ class AppState extends ChangeNotifier {
       }
       final encrypted = await cryptoService.encrypt(conversation.id, plaintext);
       await client.sendEnvelope(current.token, encrypted);
+      await refreshSelectedMessages(notify: false);
     });
   }
 
@@ -139,7 +215,7 @@ class AppState extends ChangeNotifier {
     });
   }
 
-  Future<void> approveActiveDeviceLink() async {
+  Future<void> approveActiveDeviceLink(String verificationCode) async {
     await _run(() async {
       final current = session;
       final client = api;
@@ -147,7 +223,11 @@ class AppState extends ChangeNotifier {
       if (current == null || client == null || link == null) {
         return;
       }
-      activeDeviceLink = await client.approveDeviceLink(current.token, link.id);
+      activeDeviceLink = await client.approveDeviceLink(
+        current.token,
+        link.id,
+        verificationCode,
+      );
     });
   }
 
@@ -201,14 +281,57 @@ class AppState extends ChangeNotifier {
       session = linkedSession;
       pendingDeviceLinkClaim = null;
       await localStore.saveSession(linkedSession);
+      _lastSyncEventId = 0;
+      await localStore.saveSyncCursor(0);
       await refreshConversations();
+      await refreshDevices();
       _startSync();
+    });
+  }
+
+  Future<void> logout() async {
+    await _run(() async {
+      final current = session;
+      final client = api;
+      if (current != null && client != null) {
+        await client.logout(current.token);
+      }
+      await _clearLocalSession(preserveDeviceIdentity: true);
+    });
+  }
+
+  Future<void> logoutOtherDevices() async {
+    await _run(() async {
+      final current = session;
+      final client = api;
+      if (current == null || client == null) {
+        return;
+      }
+      await client.logoutAll(current.token);
+      await refreshDevices();
+    });
+  }
+
+  Future<void> revokeDevice(String deviceId) async {
+    await _run(() async {
+      final current = session;
+      final client = api;
+      if (current == null || client == null) {
+        return;
+      }
+      await client.revokeDevice(current.token, deviceId);
+      if (deviceId == current.deviceId) {
+        await _clearLocalSession();
+      } else {
+        await refreshDevices();
+      }
     });
   }
 
   void selectConversation(String id) {
     selectedConversationId = id;
     notifyListeners();
+    unawaited(refreshSelectedMessages());
   }
 
   void _startSync() {
@@ -216,10 +339,98 @@ class AppState extends ChangeNotifier {
     if (current == null) {
       return;
     }
+    unawaited(_syncSubscription?.cancel());
     sync?.dispose();
     sync = syncServiceFactory(current.baseUrl, current.token);
-    sync!.events.listen((_) => refreshConversations());
-    sync!.connect();
+    _syncSubscription = sync!.events.listen(
+      (_) => unawaited(_catchUpSyncEvents()),
+      onError: (_) => unawaited(_catchUpSyncEvents()),
+    );
+    unawaited(_catchUpSyncEvents());
+    unawaited(sync!.connect());
+  }
+
+  Future<void> _catchUpSyncEvents() async {
+    if (_catchingUpSync) {
+      return;
+    }
+    final current = session;
+    final client = api;
+    if (current == null || client == null) {
+      return;
+    }
+    _catchingUpSync = true;
+    try {
+      final events =
+          await client.syncEvents(current.token, after: _lastSyncEventId);
+      var refreshConversationsNeeded = false;
+      var refreshSelectedMessagesNeeded = false;
+      final selectedId = selectedConversationId;
+      for (final event in events) {
+        if (event.id > _lastSyncEventId) {
+          _lastSyncEventId = event.id;
+        }
+        if (event.conversationId != null) {
+          refreshConversationsNeeded = true;
+          if (event.conversationId == selectedId) {
+            refreshSelectedMessagesNeeded = true;
+          }
+        } else if (event.type.startsWith('device.')) {
+          await refreshDevices();
+          refreshConversationsNeeded = true;
+        } else if (event.type.startsWith('conversation.')) {
+          refreshConversationsNeeded = true;
+        }
+      }
+      if (events.isNotEmpty) {
+        await localStore.saveSyncCursor(_lastSyncEventId);
+      }
+      if (refreshConversationsNeeded) {
+        await _refreshConversations(notify: false);
+      }
+      if (refreshSelectedMessagesNeeded) {
+        await refreshSelectedMessages(notify: false);
+      }
+      if (events.isNotEmpty) {
+        notifyListeners();
+      }
+    } catch (err) {
+      error = err.toString();
+      notifyListeners();
+    } finally {
+      _catchingUpSync = false;
+    }
+  }
+
+  Future<void> _clearLocalSession({bool preserveDeviceIdentity = false}) async {
+    final current = session;
+    unawaited(_syncSubscription?.cancel());
+    _syncSubscription = null;
+    sync?.dispose();
+    sync = null;
+    if (preserveDeviceIdentity &&
+        current != null &&
+        current.deviceId != null &&
+        current.deviceId!.isNotEmpty) {
+      await localStore.saveSession(Session(
+        baseUrl: current.baseUrl,
+        token: '',
+        accountId: current.accountId,
+        deviceId: current.deviceId,
+      ));
+      await localStore.saveSyncCursor(0);
+    } else {
+      await localStore.clear();
+    }
+    session = null;
+    api = null;
+    conversations = <Conversation>[];
+    devices = <Device>[];
+    messagesByConversation = <String, List<ReceivedMessageEnvelope>>{};
+    selectedConversationId = null;
+    activeDeviceLink = null;
+    pendingDeviceLinkClaim = null;
+    _lastSyncEventId = 0;
   }
 
   Future<void> _run(Future<void> Function() body) async {
@@ -234,6 +445,13 @@ class AppState extends ChangeNotifier {
       busy = false;
       notifyListeners();
     }
+  }
+
+  @override
+  void dispose() {
+    unawaited(_syncSubscription?.cancel());
+    sync?.dispose();
+    super.dispose();
   }
 }
 

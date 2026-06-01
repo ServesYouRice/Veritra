@@ -51,9 +51,78 @@ class MessageEnvelope {
   }
 }
 
+class ReceivedMessageEnvelope {
+  ReceivedMessageEnvelope({
+    required this.id,
+    required this.conversationId,
+    required this.senderAccountId,
+    required this.senderDeviceId,
+    required this.idempotencyKey,
+    required this.ciphertext,
+    required this.cryptoProtocol,
+    required this.createdAt,
+    this.cryptoMetadata,
+    this.attachmentRefs,
+    this.replyToId,
+    this.threadRootId,
+    this.editedAt,
+    this.deletedAt,
+    this.expiresAt,
+  });
+
+  final String id;
+  final String conversationId;
+  final String senderAccountId;
+  final String senderDeviceId;
+  final String idempotencyKey;
+  final List<int> ciphertext;
+  final String cryptoProtocol;
+  final Object? cryptoMetadata;
+  final Object? attachmentRefs;
+  final String? replyToId;
+  final String? threadRootId;
+  final DateTime createdAt;
+  final DateTime? editedAt;
+  final DateTime? deletedAt;
+  final DateTime? expiresAt;
+
+  factory ReceivedMessageEnvelope.fromJson(Map<String, Object?> json) {
+    return ReceivedMessageEnvelope(
+      id: json['id'] as String,
+      conversationId: json['conversation_id'] as String,
+      senderAccountId: json['sender_account_id'] as String,
+      senderDeviceId: json['sender_device_id'] as String,
+      idempotencyKey: json['idempotency_key'] as String,
+      ciphertext: _decodeBytes(json['ciphertext']),
+      cryptoProtocol: json['crypto_protocol'] as String,
+      cryptoMetadata: json['crypto_metadata'],
+      attachmentRefs: json['attachment_refs'],
+      replyToId: json['reply_to_id'] as String?,
+      threadRootId: json['thread_root_id'] as String?,
+      createdAt: DateTime.parse(json['created_at'] as String),
+      editedAt: _parseOptionalTime(json['edited_at']),
+      deletedAt: _parseOptionalTime(json['deleted_at']),
+      expiresAt: _parseOptionalTime(json['expires_at']),
+    );
+  }
+
+  static List<int> _decodeBytes(Object? value) {
+    if (value is String) {
+      return base64Decode(value);
+    }
+    if (value is List) {
+      return value.whereType<int>().toList();
+    }
+    return <int>[];
+  }
+}
+
 class MetadataSearchResult {
-  MetadataSearchResult(
-      {required this.type, required this.id, required this.label});
+  MetadataSearchResult({
+    required this.type,
+    required this.id,
+    required this.label,
+  });
 
   final String type;
   final String id;
@@ -64,6 +133,35 @@ class MetadataSearchResult {
       type: json['type'] as String,
       id: json['id'] as String,
       label: json['label'] as String,
+    );
+  }
+}
+
+class SyncEvent {
+  SyncEvent({
+    required this.id,
+    required this.type,
+    required this.createdAt,
+    this.accountId,
+    this.conversationId,
+    this.payload,
+  });
+
+  final int id;
+  final String type;
+  final String? accountId;
+  final String? conversationId;
+  final Object? payload;
+  final DateTime createdAt;
+
+  factory SyncEvent.fromJson(Map<String, Object?> json) {
+    return SyncEvent(
+      id: (json['id'] as num).toInt(),
+      type: json['type'] as String,
+      accountId: json['account_id'] as String?,
+      conversationId: json['conversation_id'] as String?,
+      payload: json['payload'],
+      createdAt: DateTime.parse(json['created_at'] as String),
     );
   }
 }
@@ -110,9 +208,52 @@ class DeviceLinkClaim {
   final String claimToken;
 }
 
+class Device {
+  Device({
+    required this.id,
+    required this.accountId,
+    required this.name,
+    required this.createdAt,
+    this.lastSeenAt,
+    this.revokedAt,
+  });
+
+  final String id;
+  final String accountId;
+  final String name;
+  final DateTime createdAt;
+  final DateTime? lastSeenAt;
+  final DateTime? revokedAt;
+
+  factory Device.fromJson(Map<String, Object?> json) {
+    return Device(
+      id: json['id'] as String,
+      accountId: json['account_id'] as String,
+      name: json['name'] as String,
+      createdAt: DateTime.parse(json['created_at'] as String),
+      lastSeenAt: _parseOptionalTime(json['last_seen_at']),
+      revokedAt: _parseOptionalTime(json['revoked_at']),
+    );
+  }
+}
+
+DateTime? _parseOptionalTime(Object? value) {
+  if (value is String && value.isNotEmpty) {
+    return DateTime.parse(value);
+  }
+  return null;
+}
+
 class Session {
-  const Session({required this.baseUrl, required this.token});
+  const Session({
+    required this.baseUrl,
+    required this.token,
+    this.accountId,
+    this.deviceId,
+  });
 
   final String baseUrl;
   final String token;
+  final String? accountId;
+  final String? deviceId;
 }

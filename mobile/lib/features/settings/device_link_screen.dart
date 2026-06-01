@@ -35,7 +35,7 @@ class DeviceLinkScreen extends StatelessWidget {
                 ),
                 const SizedBox(height: 8),
                 FilledButton.icon(
-                  onPressed: state.busy ? null : state.approveActiveDeviceLink,
+                  onPressed: state.busy ? null : () => _approve(context),
                   icon: const Icon(Icons.verified_user_outlined),
                   label: const Text('Approve device'),
                 ),
@@ -52,6 +52,43 @@ class DeviceLinkScreen extends StatelessWidget {
         );
       },
     );
+  }
+
+  Future<void> _approve(BuildContext context) async {
+    final controller = TextEditingController();
+    try {
+      final code = await showDialog<String>(
+        context: context,
+        builder: (context) {
+          return AlertDialog(
+            title: const Text('Verification code'),
+            content: TextField(
+              controller: controller,
+              autofocus: true,
+              keyboardType: TextInputType.number,
+              decoration: const InputDecoration(hintText: '000000'),
+            ),
+            actions: <Widget>[
+              TextButton(
+                onPressed: () => Navigator.of(context).pop(),
+                child: const Text('Cancel'),
+              ),
+              FilledButton(
+                onPressed: () => Navigator.of(context).pop(controller.text),
+                child: const Text('Approve'),
+              ),
+            ],
+          );
+        },
+      );
+      final trimmed = code?.trim();
+      if (trimmed == null || trimmed.isEmpty) {
+        return;
+      }
+      await state.approveActiveDeviceLink(trimmed);
+    } finally {
+      controller.dispose();
+    }
   }
 }
 

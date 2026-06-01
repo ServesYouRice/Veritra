@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"crypto/sha256"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
@@ -31,6 +32,11 @@ var (
 	ErrNotMember          = errors.New("account is not a conversation member")
 	ErrDeviceLinkInvalid  = errors.New("device link is invalid, expired, revoked, or already used")
 	ErrDeviceLinkNotReady = errors.New("device link is not approved yet")
+
+	// ErrDeviceLinkVerificationFailed is returned when the approver does not
+	// supply the link's verification code, so a device cannot be approved
+	// without the human confirming the out-of-band code shown on both devices.
+	ErrDeviceLinkVerificationFailed = errors.New("device link verification code does not match")
 )
 
 type Store struct {
@@ -380,32 +386,15 @@ type LoginRecord struct {
 
 func (s *Store) LoginRecord(ctx context.Context, username, deviceID string) (LoginRecord, error) {
 	username = domain.NormalizeUsername(username)
+	deviceID = strings.TrimSpace(deviceID)
 	record := LoginRecord{}
-	if deviceID != "" {
-		err := s.db.QueryRowContext(ctx, `
-			SELECT a.id, a.username, a.password_hash, a.role, d.id
-			FROM accounts a JOIN devices d ON d.account_id = a.id
-			WHERE a.username = ? AND d.id = ? AND a.deleted_at IS NULL AND d.revoked_at IS NULL`, username, deviceID).
-			Scan(&record.AccountID, &record.Username, &record.PasswordHash, &record.Role, &record.DeviceID)
-		if err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				return LoginRecord{}, ErrUnauthorized
-			}
-			return LoginRecord{}, err
-		}
-		return record, nil
+	if deviceID == "" {
+		return LoginRecord{}, ErrUnauthorized
 	}
-	// Without an explicit device_id, attribute the session to the
-	// most-recently-active device (last_seen_at DESC, falling back to
-	// created_at when last_seen_at is unset). This matches the user
-	// expectation "log me into my newest device", while still keeping the
-	// session tied to a specific concrete device for audit purposes.
 	err := s.db.QueryRowContext(ctx, `
 		SELECT a.id, a.username, a.password_hash, a.role, d.id
 		FROM accounts a JOIN devices d ON d.account_id = a.id
-		WHERE a.username = ? AND a.deleted_at IS NULL AND d.revoked_at IS NULL
-		ORDER BY COALESCE(d.last_seen_at, d.created_at) DESC, d.created_at DESC
-		LIMIT 1`, username).
+		WHERE a.username = ? AND d.id = ? AND a.deleted_at IS NULL AND d.revoked_at IS NULL`, username, deviceID).
 		Scan(&record.AccountID, &record.Username, &record.PasswordHash, &record.Role, &record.DeviceID)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -417,6 +406,10 @@ func (s *Store) LoginRecord(ctx context.Context, username, deviceID string) (Log
 }
 
 func (s *Store) CreateSession(ctx context.Context, tokenHash, accountID, deviceID string, expiresAt time.Time) error {
+	deviceID = strings.TrimSpace(deviceID)
+	if deviceID == "" {
+		return ErrForbidden
+	}
 	_, err := s.db.ExecContext(ctx, `INSERT INTO sessions(token_hash, account_id, device_id, expires_at, created_at) VALUES(?, ?, ?, ?, ?)`, tokenHash, accountID, nullableEmptyString(deviceID), formatTime(expiresAt), nowString())
 	return err
 }
@@ -426,7 +419,11 @@ func (s *Store) PrincipalByTokenHash(ctx context.Context, tokenHash string) (dom
 	err := s.db.QueryRowContext(ctx, `
 		SELECT a.id, COALESCE(s.device_id, ''), a.username, a.role
 		FROM sessions s JOIN accounts a ON a.id = s.account_id
-		WHERE s.token_hash = ? AND s.expires_at > ? AND a.deleted_at IS NULL`, tokenHash, nowString()).
+		LEFT JOIN devices d ON d.id = s.device_id
+		WHERE s.token_hash = ?
+		  AND s.expires_at > ?
+		  AND a.deleted_at IS NULL
+		  AND (s.device_id IS NULL OR (d.id IS NOT NULL AND d.revoked_at IS NULL))`, tokenHash, nowString()).
 		Scan(&principal.AccountID, &principal.DeviceID, &principal.Username, &principal.Role)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -434,14 +431,53 @@ func (s *Store) PrincipalByTokenHash(ctx context.Context, tokenHash string) (dom
 		}
 		return domain.Principal{}, err
 	}
-	// Best-effort last_seen_at stamp. Throttled to once per minute per device
-	// via the WHERE clause so an active client doesn't write on every request.
-	if principal.DeviceID != "" {
-		now := nowString()
-		cutoff := time.Now().UTC().Add(-time.Minute).Format(time.RFC3339Nano)
-		_, _ = s.db.ExecContext(ctx, `UPDATE devices SET last_seen_at = ? WHERE id = ? AND (last_seen_at IS NULL OR last_seen_at < ?)`, now, principal.DeviceID, cutoff)
-	}
 	return principal, nil
+}
+
+// DeleteSession removes a single session by its token hash (logout of the
+// current device). It is a no-op if the session no longer exists.
+func (s *Store) DeleteSession(ctx context.Context, tokenHash string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM sessions WHERE token_hash = ?`, tokenHash)
+	return err
+}
+
+// DeleteAccountSessionsExcept removes every session for the account except the
+// one identified by keepTokenHash. Pass an empty keepTokenHash to remove all
+// sessions (token_hash is never empty, so the comparison then matches all rows).
+func (s *Store) DeleteAccountSessionsExcept(ctx context.Context, accountID, keepTokenHash string) (int64, error) {
+	result, err := s.db.ExecContext(ctx, `DELETE FROM sessions WHERE account_id = ? AND token_hash <> ?`, accountID, keepTokenHash)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
+// RevokeDevice marks one of an account's devices revoked and deletes its
+// sessions atomically. It returns ErrNotFound when the device does not exist or
+// belongs to a different account, so a caller can only revoke its own devices.
+// PrincipalByTokenHash already rejects revoked devices on their next request.
+func (s *Store) RevokeDevice(ctx context.Context, accountID, deviceID string) error {
+	now := nowString()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `UPDATE devices SET revoked_at = COALESCE(revoked_at, ?) WHERE id = ? AND account_id = ?`, now, deviceID, accountID)
+	if err != nil {
+		return err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return ErrNotFound
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM sessions WHERE device_id = ?`, deviceID); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *Store) CreateInvite(ctx context.Context, createdBy string, maxUses int, expiresAt *time.Time) (domain.Invite, error) {
@@ -591,7 +627,7 @@ func (s *Store) DeviceLinkForAccount(ctx context.Context, linkID, accountID stri
 	return link, nil
 }
 
-func (s *Store) ApproveDeviceLink(ctx context.Context, linkID, accountID string) (domain.DeviceLink, domain.Device, error) {
+func (s *Store) ApproveDeviceLink(ctx context.Context, linkID, accountID, verificationCode string) (domain.DeviceLink, domain.Device, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return domain.DeviceLink{}, domain.Device{}, err
@@ -612,6 +648,13 @@ func (s *Store) ApproveDeviceLink(ctx context.Context, linkID, accountID string)
 			return domain.DeviceLink{}, domain.Device{}, ErrDeviceLinkInvalid
 		}
 		return domain.DeviceLink{}, domain.Device{}, err
+	}
+	// The approver must confirm the out-of-band verification code shown on both
+	// devices. Without this, an authenticated user could blindly approve an
+	// attacker-controlled claimed device. Constant-time compare avoids leaking
+	// the code through timing.
+	if subtle.ConstantTimeCompare([]byte(strings.TrimSpace(verificationCode)), []byte(link.VerificationCode)) != 1 {
+		return domain.DeviceLink{}, domain.Device{}, ErrDeviceLinkVerificationFailed
 	}
 	if strings.TrimSpace(deviceName) == "" || len(keyPackage) == 0 {
 		return domain.DeviceLink{}, domain.Device{}, ErrDeviceLinkInvalid
@@ -767,6 +810,7 @@ type CreateConversationInput struct {
 	ChannelID        *string
 	CreatedBy        string
 	RetentionSeconds *int64
+	MemberAccountIDs []string
 }
 
 func (s *Store) CreateConversation(ctx context.Context, input CreateConversationInput) (domain.Conversation, error) {
@@ -780,6 +824,32 @@ func (s *Store) CreateConversation(ctx context.Context, input CreateConversation
 		return domain.Conversation{}, err
 	}
 	defer tx.Rollback()
+	// A community-channel conversation must point at a channel the creator may
+	// actually use: the creator has to belong to the community and the channel
+	// must belong to that same community. Validated inside the transaction so it
+	// is authoritative and consistent with the insert below.
+	if input.Kind == "community_channel" {
+		if input.CommunityID == nil || input.ChannelID == nil {
+			return domain.Conversation{}, ErrForbidden
+		}
+		var memberCount int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM memberships WHERE account_id = ? AND community_id = ?`, input.CreatedBy, *input.CommunityID).Scan(&memberCount); err != nil {
+			return domain.Conversation{}, err
+		}
+		if memberCount == 0 {
+			return domain.Conversation{}, ErrForbidden
+		}
+		var channelCommunity string
+		if err := tx.QueryRowContext(ctx, `SELECT community_id FROM channels WHERE id = ?`, *input.ChannelID).Scan(&channelCommunity); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return domain.Conversation{}, ErrNotFound
+			}
+			return domain.Conversation{}, err
+		}
+		if channelCommunity != *input.CommunityID {
+			return domain.Conversation{}, ErrForbidden
+		}
+	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO conversations(id, kind, title, community_id, channel_id, created_by, retention_seconds, created_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?)`, id, input.Kind, nullableString(input.Title), nullableString(input.CommunityID), nullableString(input.ChannelID), input.CreatedBy, nullableInt64(input.RetentionSeconds), createdAt); err != nil {
 		return domain.Conversation{}, err
 	}
@@ -789,6 +859,26 @@ func (s *Store) CreateConversation(ctx context.Context, input CreateConversation
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO memberships(id, account_id, conversation_id, role, created_at) VALUES(?, ?, ?, 'owner', ?)`, membershipID, input.CreatedBy, id, createdAt); err != nil {
 		return domain.Conversation{}, err
+	}
+	// Initial members are added in the same transaction so a mid-loop failure
+	// cannot leave a half-populated conversation (the whole create rolls back).
+	seen := map[string]struct{}{input.CreatedBy: {}}
+	for _, accountID := range input.MemberAccountIDs {
+		accountID = strings.TrimSpace(accountID)
+		if accountID == "" {
+			continue
+		}
+		if _, dup := seen[accountID]; dup {
+			continue
+		}
+		seen[accountID] = struct{}{}
+		memberRowID, err := domain.NewID("mbr")
+		if err != nil {
+			return domain.Conversation{}, err
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO memberships(id, account_id, conversation_id, role, created_at) VALUES(?, ?, ?, ?, ?) ON CONFLICT(account_id, conversation_id) DO NOTHING`, memberRowID, accountID, id, domain.RoleMember, createdAt); err != nil {
+			return domain.Conversation{}, err
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return domain.Conversation{}, err
@@ -928,6 +1018,9 @@ func (s *Store) IsConversationMember(ctx context.Context, conversationID, accoun
 }
 
 func (s *Store) SaveMessageEnvelope(ctx context.Context, envelope domain.MessageEnvelope) (domain.MessageEnvelope, bool, error) {
+	if err := s.pruneExpiredMessageByIdempotency(ctx, envelope.SenderDeviceID, envelope.IdempotencyKey, time.Now().UTC()); err != nil {
+		return domain.MessageEnvelope{}, false, err
+	}
 	existing, err := s.messageByIdempotency(ctx, envelope.SenderDeviceID, envelope.IdempotencyKey)
 	if err == nil {
 		return existing, true, nil
@@ -955,6 +1048,16 @@ func (s *Store) SaveMessageEnvelope(ctx context.Context, envelope domain.Message
 		envelope.AttachmentRefs = json.RawMessage(`[]`)
 	}
 	envelope.CreatedAt = time.Now().UTC()
+	retentionSeconds, err := s.conversationRetention(ctx, envelope.ConversationID)
+	if err != nil {
+		return domain.MessageEnvelope{}, false, err
+	}
+	if retentionSeconds != nil {
+		retentionExpiresAt := envelope.CreatedAt.Add(time.Duration(*retentionSeconds) * time.Second)
+		if envelope.ExpiresAt == nil || envelope.ExpiresAt.After(retentionExpiresAt) {
+			envelope.ExpiresAt = &retentionExpiresAt
+		}
+	}
 	_, err = s.db.ExecContext(ctx, `
 		INSERT INTO message_envelopes(id, conversation_id, sender_account_id, sender_device_id, idempotency_key, ciphertext, crypto_protocol, crypto_metadata_json, attachment_refs_json, reply_to_id, thread_root_id, created_at, expires_at)
 		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -966,7 +1069,7 @@ func (s *Store) SaveMessageEnvelope(ctx context.Context, envelope domain.Message
 }
 
 func (s *Store) messageByIdempotency(ctx context.Context, deviceID, key string) (domain.MessageEnvelope, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT id, conversation_id, sender_account_id, sender_device_id, idempotency_key, ciphertext, crypto_protocol, crypto_metadata_json, attachment_refs_json, reply_to_id, thread_root_id, created_at, edited_at, deleted_at, expires_at FROM message_envelopes WHERE sender_device_id = ? AND idempotency_key = ?`, deviceID, key)
+	row := s.db.QueryRowContext(ctx, `SELECT id, conversation_id, sender_account_id, sender_device_id, idempotency_key, ciphertext, crypto_protocol, crypto_metadata_json, attachment_refs_json, reply_to_id, thread_root_id, created_at, edited_at, deleted_at, expires_at FROM message_envelopes WHERE sender_device_id = ? AND idempotency_key = ? AND (expires_at IS NULL OR expires_at > ?)`, deviceID, key, nowString())
 	msg, err := scanMessage(row)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -978,7 +1081,7 @@ func (s *Store) messageByIdempotency(ctx context.Context, deviceID, key string) 
 }
 
 func (s *Store) MessageByID(ctx context.Context, messageID string) (domain.MessageEnvelope, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT id, conversation_id, sender_account_id, sender_device_id, idempotency_key, ciphertext, crypto_protocol, crypto_metadata_json, attachment_refs_json, reply_to_id, thread_root_id, created_at, edited_at, deleted_at, expires_at FROM message_envelopes WHERE id = ?`, messageID)
+	row := s.db.QueryRowContext(ctx, `SELECT id, conversation_id, sender_account_id, sender_device_id, idempotency_key, ciphertext, crypto_protocol, crypto_metadata_json, attachment_refs_json, reply_to_id, thread_root_id, created_at, edited_at, deleted_at, expires_at FROM message_envelopes WHERE id = ? AND (expires_at IS NULL OR expires_at > ?)`, messageID, nowString())
 	msg, err := scanMessage(row)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -999,8 +1102,8 @@ func (s *Store) UpdateMessageEnvelope(ctx context.Context, messageID, accountID 
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE message_envelopes
 		SET ciphertext = ?, crypto_protocol = ?, crypto_metadata_json = ?, edited_at = ?
-		WHERE id = ? AND sender_account_id = ? AND deleted_at IS NULL`,
-		ciphertext, cryptoProtocol, string(cryptoMetadata), nowString(), messageID, accountID)
+		WHERE id = ? AND sender_account_id = ? AND deleted_at IS NULL AND (expires_at IS NULL OR expires_at > ?)`,
+		ciphertext, cryptoProtocol, string(cryptoMetadata), nowString(), messageID, accountID, nowString())
 	if err != nil {
 		return domain.MessageEnvelope{}, err
 	}
@@ -1018,8 +1121,8 @@ func (s *Store) DeleteMessageEnvelope(ctx context.Context, messageID, accountID 
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE message_envelopes
 		SET ciphertext = ?, crypto_protocol = ?, crypto_metadata_json = ?, deleted_at = ?
-		WHERE id = ? AND sender_account_id = ? AND deleted_at IS NULL`,
-		markerCiphertext, cryptoProtocol, string(cryptoMetadata), now, messageID, accountID)
+		WHERE id = ? AND sender_account_id = ? AND deleted_at IS NULL AND (expires_at IS NULL OR expires_at > ?)`,
+		markerCiphertext, cryptoProtocol, string(cryptoMetadata), now, messageID, accountID, nowString())
 	if err != nil {
 		return domain.MessageEnvelope{}, err
 	}
@@ -1076,9 +1179,9 @@ func (s *Store) ListMessages(ctx context.Context, conversationID, accountID stri
 			return nil, err
 		}
 		rows, err = s.db.QueryContext(ctx, `SELECT `+cols+` FROM message_envelopes
-			WHERE conversation_id = ? AND (created_at < ? OR (created_at = ? AND id < ?))
+			WHERE conversation_id = ? AND (expires_at IS NULL OR expires_at > ?) AND (created_at < ? OR (created_at = ? AND id < ?))
 			ORDER BY created_at DESC, id DESC LIMIT ?`,
-			conversationID, cursorAt, cursorAt, opts.BeforeID, limit)
+			conversationID, nowString(), cursorAt, cursorAt, opts.BeforeID, limit)
 		if err != nil {
 			return nil, err
 		}
@@ -1088,16 +1191,16 @@ func (s *Store) ListMessages(ctx context.Context, conversationID, accountID stri
 			return nil, err
 		}
 		rows, err = s.db.QueryContext(ctx, `SELECT `+cols+` FROM message_envelopes
-			WHERE conversation_id = ? AND (created_at > ? OR (created_at = ? AND id > ?))
+			WHERE conversation_id = ? AND (expires_at IS NULL OR expires_at > ?) AND (created_at > ? OR (created_at = ? AND id > ?))
 			ORDER BY created_at ASC, id ASC LIMIT ?`,
-			conversationID, cursorAt, cursorAt, opts.AfterID, limit)
+			conversationID, nowString(), cursorAt, cursorAt, opts.AfterID, limit)
 		if err != nil {
 			return nil, err
 		}
 	default:
 		rows, err = s.db.QueryContext(ctx, `SELECT `+cols+` FROM message_envelopes
-			WHERE conversation_id = ?
-			ORDER BY created_at DESC, id DESC LIMIT ?`, conversationID, limit)
+			WHERE conversation_id = ? AND (expires_at IS NULL OR expires_at > ?)
+			ORDER BY created_at DESC, id DESC LIMIT ?`, conversationID, nowString(), limit)
 		if err != nil {
 			return nil, err
 		}
@@ -1119,7 +1222,7 @@ func (s *Store) ListMessages(ctx context.Context, conversationID, accountID stri
 // conversation. Used to validate before/after cursors.
 func (s *Store) messageCursor(ctx context.Context, conversationID, messageID string) (string, error) {
 	var createdAt string
-	err := s.db.QueryRowContext(ctx, `SELECT created_at FROM message_envelopes WHERE id = ? AND conversation_id = ?`, messageID, conversationID).Scan(&createdAt)
+	err := s.db.QueryRowContext(ctx, `SELECT created_at FROM message_envelopes WHERE id = ? AND conversation_id = ? AND (expires_at IS NULL OR expires_at > ?)`, messageID, conversationID, nowString()).Scan(&createdAt)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return "", ErrNotFound
@@ -1127,6 +1230,35 @@ func (s *Store) messageCursor(ctx context.Context, conversationID, messageID str
 		return "", err
 	}
 	return createdAt, nil
+}
+
+func (s *Store) conversationRetention(ctx context.Context, conversationID string) (*int64, error) {
+	var retention sql.NullInt64
+	if err := s.db.QueryRowContext(ctx, `SELECT retention_seconds FROM conversations WHERE id = ?`, conversationID).Scan(&retention); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	if !retention.Valid {
+		return nil, nil
+	}
+	return &retention.Int64, nil
+}
+
+func (s *Store) pruneExpiredMessageByIdempotency(ctx context.Context, deviceID, key string, now time.Time) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM message_envelopes WHERE sender_device_id = ? AND idempotency_key = ? AND expires_at IS NOT NULL AND expires_at <= ?`, deviceID, key, formatTime(now.UTC()))
+	return err
+}
+
+// PruneExpiredMessages deletes server-held encrypted envelopes whose
+// disappearing-message expiry has passed.
+func (s *Store) PruneExpiredMessages(ctx context.Context, now time.Time) (int64, error) {
+	result, err := s.db.ExecContext(ctx, `DELETE FROM message_envelopes WHERE expires_at IS NOT NULL AND expires_at <= ?`, formatTime(now.UTC()))
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
 }
 
 // PruneSyncEvents deletes sync events older than the cutoff. Returns the
@@ -1152,15 +1284,17 @@ func (s *Store) PruneAuditEvents(ctx context.Context, olderThan time.Time) (int6
 // RecordAuditEvent appends a metadata-only audit row. Callers MUST NOT pass
 // message content, ciphertext, or any field that would defeat the privacy
 // promise that admins cannot read user data.
-func (s *Store) RecordAuditEvent(ctx context.Context, actorAccountID *string, eventType string, metadata interface{}) {
+func (s *Store) RecordAuditEvent(ctx context.Context, actorAccountID *string, eventType string, metadata interface{}) error {
 	payload := json.RawMessage(`{}`)
 	if metadata != nil {
 		b, err := json.Marshal(metadata)
-		if err == nil {
-			payload = b
+		if err != nil {
+			return err
 		}
+		payload = b
 	}
-	_, _ = s.db.ExecContext(ctx, `INSERT INTO audit_events(actor_account_id, event_type, metadata_json, created_at) VALUES(?, ?, ?, ?)`, nullableString(actorAccountID), eventType, string(payload), nowString())
+	_, err := s.db.ExecContext(ctx, `INSERT INTO audit_events(actor_account_id, event_type, metadata_json, created_at) VALUES(?, ?, ?, ?)`, nullableString(actorAccountID), eventType, string(payload), nowString())
+	return err
 }
 
 func (s *Store) SaveSyncEvent(ctx context.Context, eventType string, accountID *string, conversationID string, payload interface{}) (int64, error) {
@@ -1181,14 +1315,18 @@ func (s *Store) ListSyncEvents(ctx context.Context, accountID string, afterID in
 	}
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, event_type, account_id, conversation_id, payload_json, created_at
-		FROM sync_events
-		WHERE id > ?
-		  AND (
-		    account_id = ?
-		    OR conversation_id IN (SELECT conversation_id FROM memberships WHERE account_id = ? AND conversation_id IS NOT NULL)
-		  )
+		FROM (
+			SELECT id, event_type, account_id, conversation_id, payload_json, created_at
+			FROM sync_events
+			WHERE id > ? AND account_id = ?
+			UNION ALL
+			SELECT se.id, se.event_type, se.account_id, se.conversation_id, se.payload_json, se.created_at
+			FROM sync_events se
+			JOIN memberships m ON m.conversation_id = se.conversation_id
+			WHERE se.id > ? AND se.account_id IS NULL AND m.account_id = ?
+		) visible_events
 		ORDER BY id ASC
-		LIMIT ?`, afterID, accountID, accountID, limit)
+		LIMIT ?`, afterID, accountID, afterID, accountID, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -1217,24 +1355,24 @@ func (s *Store) SearchMetadata(ctx context.Context, accountID, query string, lim
 	}
 	exact := query
 	prefixPattern := escapeLike(query) + "%"
-	containsPattern := "%" + escapeLike(query) + "%"
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT type, id, label
 		FROM (
-			SELECT 'account' AS type, id, username AS label,
-				CASE
-					WHEN username = ? COLLATE NOCASE THEN 0
-					WHEN username LIKE ? ESCAPE '\' THEN 1
-					ELSE 2
-				END AS rank
+			-- Accounts are matched on the exact (case-insensitive) username only.
+			-- Prefix/contains matching here would let any authenticated user walk
+			-- the substring space and enumerate the entire user directory, which
+			-- is a metadata leak for a private messenger. Communities/channels
+			-- below stay prefix/contains because they are scoped to the caller's
+			-- memberships. Prefix-only matching also keeps this endpoint on
+			-- ordinary indexes instead of leading-wildcard scans.
+			SELECT 'account' AS type, id, username AS label, 0 AS rank
 			FROM accounts
-			WHERE deleted_at IS NULL AND username LIKE ? ESCAPE '\'
+			WHERE deleted_at IS NULL AND username = ? COLLATE NOCASE
 			UNION ALL
 			SELECT 'community' AS type, c.id, c.name AS label,
 				CASE
 					WHEN c.name = ? COLLATE NOCASE THEN 0
-					WHEN c.name LIKE ? ESCAPE '\' THEN 1
-					ELSE 2
+					ELSE 1
 				END AS rank
 			FROM communities c
 			JOIN memberships m ON m.community_id = c.id
@@ -1243,8 +1381,7 @@ func (s *Store) SearchMetadata(ctx context.Context, accountID, query string, lim
 			SELECT 'channel' AS type, ch.id, ch.name AS label,
 				CASE
 					WHEN ch.name = ? COLLATE NOCASE THEN 0
-					WHEN ch.name LIKE ? ESCAPE '\' THEN 1
-					ELSE 2
+					ELSE 1
 				END AS rank
 			FROM channels ch
 			JOIN memberships m ON m.community_id = ch.community_id
@@ -1252,9 +1389,9 @@ func (s *Store) SearchMetadata(ctx context.Context, accountID, query string, lim
 		)
 		ORDER BY rank, label COLLATE NOCASE, type, id
 		LIMIT ? OFFSET ?`,
-		exact, prefixPattern, containsPattern,
-		exact, prefixPattern, accountID, containsPattern,
-		exact, prefixPattern, accountID, containsPattern,
+		exact,
+		exact, accountID, prefixPattern,
+		exact, accountID, prefixPattern,
 		limit, offset)
 	if err != nil {
 		return nil, err
@@ -1328,7 +1465,7 @@ func (s *Store) MarkRead(ctx context.Context, conversationID, accountID, message
 		return ErrNotMember
 	}
 	var count int
-	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM message_envelopes WHERE id = ? AND conversation_id = ?`, messageID, conversationID).Scan(&count); err != nil {
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM message_envelopes WHERE id = ? AND conversation_id = ? AND (expires_at IS NULL OR expires_at > ?)`, messageID, conversationID, nowString()).Scan(&count); err != nil {
 		return err
 	}
 	if count == 0 {
@@ -1499,7 +1636,7 @@ func (s *Store) listVisibleMessagesForExport(ctx context.Context, accountID, bef
 		err = s.db.QueryRowContext(ctx, `
 			SELECT me.created_at FROM message_envelopes me
 			JOIN memberships m ON m.conversation_id = me.conversation_id
-			WHERE m.account_id = ? AND me.id = ?`, accountID, beforeID).Scan(&cursorAt)
+			WHERE m.account_id = ? AND me.id = ? AND (me.expires_at IS NULL OR me.expires_at > ?)`, accountID, beforeID, nowString()).Scan(&cursorAt)
 		if err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				return nil, ErrNotFound
@@ -1511,17 +1648,19 @@ func (s *Store) listVisibleMessagesForExport(ctx context.Context, accountID, bef
 			FROM message_envelopes me
 			JOIN memberships m ON m.conversation_id = me.conversation_id
 			WHERE m.account_id = ?
+			  AND (me.expires_at IS NULL OR me.expires_at > ?)
 			  AND (me.created_at < ? OR (me.created_at = ? AND me.id < ?))
 			ORDER BY me.created_at DESC, me.id DESC
-			LIMIT ?`, accountID, cursorAt, cursorAt, beforeID, limit)
+			LIMIT ?`, accountID, nowString(), cursorAt, cursorAt, beforeID, limit)
 	} else {
 		rows, err = s.db.QueryContext(ctx, `
 			SELECT `+cols+`
 			FROM message_envelopes me
 			JOIN memberships m ON m.conversation_id = me.conversation_id
 			WHERE m.account_id = ?
+			  AND (me.expires_at IS NULL OR me.expires_at > ?)
 			ORDER BY me.created_at DESC, me.id DESC
-			LIMIT ?`, accountID, limit)
+			LIMIT ?`, accountID, nowString(), limit)
 	}
 	if err != nil {
 		return nil, err
@@ -1747,7 +1886,7 @@ func nowString() string {
 }
 
 func formatTime(t time.Time) string {
-	return t.UTC().Format(time.RFC3339Nano)
+	return t.UTC().Format("2006-01-02T15:04:05.000000000Z")
 }
 
 func escapeLike(value string) string {

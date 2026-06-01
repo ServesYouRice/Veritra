@@ -3,10 +3,13 @@ set -eu
 
 ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 
+# Keep gofmt and go vet as distinct checks so a formatting failure does not mask
+# vet output (and vice versa); each reports its own result.
+go_lint='unformatted="$(gofmt -l .)"; if [ -n "$unformatted" ]; then echo "gofmt needed:"; echo "$unformatted"; exit 1; fi; go vet ./...'
 if command -v go >/dev/null 2>&1; then
-  (cd "$ROOT/server" && gofmt -l . > /tmp/private-messenger-gofmt.txt && test ! -s /tmp/private-messenger-gofmt.txt && go vet ./...)
+  (cd "$ROOT/server" && sh -c "$go_lint")
 else
-  docker run --rm -v "$ROOT:/workspace" -w /workspace/server golang:1.25 sh -c 'gofmt -l . > /tmp/private-messenger-gofmt.txt && test ! -s /tmp/private-messenger-gofmt.txt && go vet ./...'
+  docker run --rm -v "$ROOT:/workspace" -w /workspace/server golang:1.25 sh -c "$go_lint"
 fi
 
 if command -v cargo >/dev/null 2>&1; then
@@ -16,7 +19,7 @@ else
 fi
 
 if command -v flutter >/dev/null 2>&1; then
-  (cd "$ROOT/mobile" && flutter pub get && flutter analyze)
+  (cd "$ROOT/mobile" && flutter pub get && flutter analyze && dart format --set-exit-if-changed .)
 else
-  docker run --rm -v "$ROOT:/workspace" -w /workspace/mobile ghcr.io/cirruslabs/flutter:stable sh -c 'flutter pub get && flutter analyze'
+  docker run --rm -v "$ROOT:/workspace" -w /workspace/mobile ghcr.io/cirruslabs/flutter:stable sh -c 'flutter pub get && flutter analyze && dart format --set-exit-if-changed .'
 fi

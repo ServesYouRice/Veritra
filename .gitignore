@@ -29,3 +29,6 @@ crypto/rust/target/
 Thumbs.db
 .idea/
 .vscode/
+
+# Local agent config
+.claude/

@@ -99,9 +99,62 @@ void main() {
     expect(state.activeDeviceLink?.claimedDeviceName, 'linked tablet');
     expect(state.activeDeviceLink?.code, 'PAIRCODE');
 
-    await state.approveActiveDeviceLink();
+    await state.approveActiveDeviceLink('654321');
     expect(state.activeDeviceLink?.state, 'approved');
     expect(state.activeDeviceLink?.approvedDeviceId, 'dev_linked');
+  });
+
+  test('app state refreshes encrypted messages for selected conversation',
+      () async {
+    final api = FakeDeviceLinkApiClient();
+    final state = AppState(
+      apiClientFactory: (_) => api,
+      cryptoService: TestOnlyCryptoService(),
+      localStore: MemoryLocalStore(),
+      syncServiceFactory: (_, __) => FakeSyncService(),
+    )
+      ..api = api
+      ..session = const Session(
+        baseUrl: 'http://localhost:8080',
+        token: 'owner-token',
+        accountId: 'acct_owner',
+        deviceId: 'dev_owner',
+      )
+      ..conversations = <Conversation>[
+        Conversation(id: 'conv_1', kind: 'group'),
+      ];
+
+    state.selectConversation('conv_1');
+    await Future<void>.delayed(Duration.zero);
+
+    expect(state.selectedMessages, hasLength(1));
+    expect(state.selectedMessages.first.ciphertext, <int>[1, 2, 3]);
+  });
+
+  test('logout preserves local device identity for password sign-in', () async {
+    final localStore = MemoryLocalStore();
+    final api = FakeDeviceLinkApiClient();
+    final state = AppState(
+      apiClientFactory: (_) => api,
+      cryptoService: TestOnlyCryptoService(),
+      localStore: localStore,
+      syncServiceFactory: (_, __) => FakeSyncService(),
+    )
+      ..api = api
+      ..session = const Session(
+        baseUrl: 'http://localhost:8080',
+        token: 'owner-token',
+        accountId: 'acct_owner',
+        deviceId: 'dev_owner',
+      );
+
+    await localStore.saveSession(state.session!);
+    await state.logout();
+
+    expect(state.session, isNull);
+    final stored = await localStore.loadSession();
+    expect(stored?.token, '');
+    expect(stored?.deviceId, 'dev_owner');
   });
 }
 
@@ -132,7 +185,14 @@ class FakeDeviceLinkApiClient extends ApiClient {
   }
 
   @override
-  Future<DeviceLink> approveDeviceLink(String token, String linkId) async {
+  Future<DeviceLink> approveDeviceLink(
+    String token,
+    String linkId,
+    String verificationCode,
+  ) async {
+    if (verificationCode != '654321') {
+      throw StateError('verification mismatch');
+    }
     return _link(
       state: 'approved',
       code: 'PAIRCODE',
@@ -146,12 +206,60 @@ class FakeDeviceLinkApiClient extends ApiClient {
     return const Session(
       baseUrl: 'http://localhost:8080',
       token: 'linked-token',
+      accountId: 'acct_owner',
+      deviceId: 'dev_linked',
     );
   }
 
   @override
   Future<List<Conversation>> conversations(String token) async {
     return <Conversation>[];
+  }
+
+  @override
+  Future<List<Device>> devices(String token) async {
+    return <Device>[
+      Device(
+        id: 'dev_linked',
+        accountId: 'acct_owner',
+        name: 'linked tablet',
+        createdAt: DateTime.parse('2026-05-29T12:00:00Z'),
+      ),
+    ];
+  }
+
+  @override
+  Future<void> logout(String token) async {}
+
+  @override
+  Future<List<ReceivedMessageEnvelope>> listMessages(
+    String token,
+    String conversationId, {
+    int limit = 50,
+    String? before,
+    String? after,
+  }) async {
+    return <ReceivedMessageEnvelope>[
+      ReceivedMessageEnvelope(
+        id: 'msg_1',
+        conversationId: conversationId,
+        senderAccountId: 'acct_owner',
+        senderDeviceId: 'dev_owner',
+        idempotencyKey: 'idem_1',
+        ciphertext: <int>[1, 2, 3],
+        cryptoProtocol: 'mls-openmls-todo',
+        createdAt: DateTime.parse('2026-05-29T12:00:00Z'),
+      ),
+    ];
+  }
+
+  @override
+  Future<List<SyncEvent>> syncEvents(
+    String token, {
+    int after = 0,
+    int limit = 100,
+  }) async {
+    return <SyncEvent>[];
   }
 
   DeviceLink _link({

@@ -116,6 +116,91 @@ func TestConversationRetentionPolicyMetadataPersists(t *testing.T) {
 	}
 }
 
+func TestExpiredMessagesAreHiddenAndPruned(t *testing.T) {
+	ctx := context.Background()
+	store, _ := newTestStore(t, ctx)
+	defer store.Close()
+	owner := createTestOwner(t, ctx, store)
+	expiringConversation, err := store.CreateConversation(ctx, CreateConversationInput{Kind: "group", CreatedBy: owner.Account.ID})
+	if err != nil {
+		t.Fatalf("create conversation: %v", err)
+	}
+	expiredAt := time.Now().UTC().Add(-time.Hour)
+	expired, _, err := store.SaveMessageEnvelope(ctx, domain.MessageEnvelope{
+		ConversationID:  expiringConversation.ID,
+		SenderAccountID: owner.Account.ID,
+		SenderDeviceID:  owner.Device.ID,
+		IdempotencyKey:  "expired-message",
+		Ciphertext:      []byte("expired ciphertext"),
+		CryptoProtocol:  "mls-openmls-todo",
+		ExpiresAt:       &expiredAt,
+	})
+	if err != nil {
+		t.Fatalf("save expired message: %v", err)
+	}
+	messages, err := store.ListMessages(ctx, expiringConversation.ID, owner.Account.ID, ListMessagesOptions{Limit: 10})
+	if err != nil {
+		t.Fatalf("list messages: %v", err)
+	}
+	if len(messages) != 0 {
+		t.Fatalf("expired message should be hidden: %#v", messages)
+	}
+	if _, err := store.MessageByID(ctx, expired.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expired message lookup err=%v want %v", err, ErrNotFound)
+	}
+	removed, err := store.PruneExpiredMessages(ctx, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("prune expired messages: %v", err)
+	}
+	if removed != 1 {
+		t.Fatalf("removed=%d want 1", removed)
+	}
+}
+
+func TestRetentionCapsMessageExpiry(t *testing.T) {
+	ctx := context.Background()
+	store, _ := newTestStore(t, ctx)
+	defer store.Close()
+	owner := createTestOwner(t, ctx, store)
+	retention := int64(60)
+	conversation, err := store.CreateConversation(ctx, CreateConversationInput{Kind: "group", CreatedBy: owner.Account.ID, RetentionSeconds: &retention})
+	if err != nil {
+		t.Fatalf("create conversation: %v", err)
+	}
+	clientExpiry := time.Now().UTC().Add(time.Hour)
+	msg, _, err := store.SaveMessageEnvelope(ctx, domain.MessageEnvelope{
+		ConversationID:  conversation.ID,
+		SenderAccountID: owner.Account.ID,
+		SenderDeviceID:  owner.Device.ID,
+		IdempotencyKey:  "retention-capped",
+		Ciphertext:      []byte("retention ciphertext"),
+		CryptoProtocol:  "mls-openmls-todo",
+		ExpiresAt:       &clientExpiry,
+	})
+	if err != nil {
+		t.Fatalf("save retention-capped message: %v", err)
+	}
+	if msg.ExpiresAt == nil {
+		t.Fatal("expected retention to set expires_at")
+	}
+	if msg.ExpiresAt.Sub(msg.CreatedAt) > time.Duration(retention)*time.Second+time.Second {
+		t.Fatalf("expires_at not capped by retention: created=%s expires=%s", msg.CreatedAt, msg.ExpiresAt)
+	}
+}
+
+func TestFixedWidthTimestampStringsSortChronologically(t *testing.T) {
+	wholeSecond := formatTime(time.Date(2026, 5, 29, 12, 0, 5, 0, time.UTC))
+	halfSecond := formatTime(time.Date(2026, 5, 29, 12, 0, 5, 500_000_000, time.UTC))
+	nextSecond := formatTime(time.Date(2026, 5, 29, 12, 0, 6, 0, time.UTC))
+
+	if wholeSecond >= halfSecond || halfSecond >= nextSecond {
+		t.Fatalf("timestamps do not sort chronologically: %q %q %q", wholeSecond, halfSecond, nextSecond)
+	}
+	if !strings.Contains(wholeSecond, ".000000000Z") {
+		t.Fatalf("whole-second timestamp is not fixed width: %q", wholeSecond)
+	}
+}
+
 func TestMessageMarkersSyncSearchExportAndMembershipGuards(t *testing.T) {
 	ctx := context.Background()
 	store, _ := newTestStore(t, ctx)
@@ -234,14 +319,11 @@ func TestMetadataSearchRanksAndPaginatesAllowedLabelsOnly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first page metadata search: %v", err)
 	}
-	if len(firstPage) != 2 {
-		t.Fatalf("first page len=%d want 2: %#v", len(firstPage), firstPage)
+	if len(firstPage) != 1 {
+		t.Fatalf("first page len=%d want 1: %#v", len(firstPage), firstPage)
 	}
 	if firstPage[0].Type != "community" || firstPage[0].Label != "Alpha" {
 		t.Fatalf("exact match should rank first: %#v", firstPage)
-	}
-	if firstPage[1].Label != "Team Alpha" {
-		t.Fatalf("contains match should be second for this fixture: %#v", firstPage)
 	}
 
 	secondPage, err := store.SearchMetadata(ctx, owner.Account.ID, "alpha", 2, 2)
@@ -250,6 +332,14 @@ func TestMetadataSearchRanksAndPaginatesAllowedLabelsOnly(t *testing.T) {
 	}
 	if len(secondPage) != 0 {
 		t.Fatalf("unexpected second page results: %#v", secondPage)
+	}
+
+	teamPrefixResults, err := store.SearchMetadata(ctx, owner.Account.ID, "team", 10, 0)
+	if err != nil {
+		t.Fatalf("team prefix metadata search: %v", err)
+	}
+	if len(teamPrefixResults) != 1 || teamPrefixResults[0].Label != "Team Alpha" {
+		t.Fatalf("prefix query should find Team Alpha: %#v", teamPrefixResults)
 	}
 
 	prefixResults, err := store.SearchMetadata(ctx, owner.Account.ID, "alp", 10, 0)
@@ -266,6 +356,49 @@ func TestMetadataSearchRanksAndPaginatesAllowedLabelsOnly(t *testing.T) {
 	}
 	if len(ciphertextResults) != 0 {
 		t.Fatalf("metadata search should not inspect messages: %#v", ciphertextResults)
+	}
+}
+
+func TestMetadataSearchDoesNotEnumerateAccountsBySubstring(t *testing.T) {
+	ctx := context.Background()
+	store, _ := newTestStore(t, ctx)
+	defer store.Close()
+	owner := createTestOwner(t, ctx, store)
+	invite, err := store.CreateInvite(ctx, owner.Account.ID, 2, nil)
+	if err != nil {
+		t.Fatalf("create invite: %v", err)
+	}
+	target := registerTestMember(t, ctx, store, invite.Code, "charlietarget")
+
+	// A prefix/substring of an unrelated account's username must not reveal it,
+	// otherwise any authenticated user could walk the substring space and dump
+	// the entire user directory.
+	for _, q := range []string{"char", "charlie", "harli", "target"} {
+		results, err := store.SearchMetadata(ctx, owner.Account.ID, q, 50, 0)
+		if err != nil {
+			t.Fatalf("search %q: %v", q, err)
+		}
+		for _, r := range results {
+			if r.Type == "account" && r.ID == target.Account.ID {
+				t.Fatalf("substring query %q leaked unrelated account: %#v", q, r)
+			}
+		}
+	}
+
+	// Exact (case-insensitive) username lookup still works so a user can find a
+	// known contact to start a conversation.
+	exact, err := store.SearchMetadata(ctx, owner.Account.ID, "CharlieTarget", 50, 0)
+	if err != nil {
+		t.Fatalf("exact search: %v", err)
+	}
+	found := false
+	for _, r := range exact {
+		if r.Type == "account" && r.ID == target.Account.ID {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("exact username lookup should find the account: %#v", exact)
 	}
 }
 
@@ -314,7 +447,10 @@ func TestDeviceLinkRequiresApprovalBeforeSession(t *testing.T) {
 	if _, err := store.ConsumeApprovedDeviceLink(ctx, link.ID, auth.HashToken(claimToken), sessionTokenHash, time.Now().UTC().Add(time.Hour)); !errors.Is(err, ErrDeviceLinkNotReady) {
 		t.Fatalf("pre-approval consume err=%v want %v", err, ErrDeviceLinkNotReady)
 	}
-	approved, device, err := store.ApproveDeviceLink(ctx, link.ID, owner.Account.ID)
+	if _, _, err := store.ApproveDeviceLink(ctx, link.ID, owner.Account.ID, "000000"); !errors.Is(err, ErrDeviceLinkVerificationFailed) {
+		t.Fatalf("wrong verification code err=%v want %v", err, ErrDeviceLinkVerificationFailed)
+	}
+	approved, device, err := store.ApproveDeviceLink(ctx, link.ID, owner.Account.ID, link.VerificationCode)
 	if err != nil {
 		t.Fatalf("approve device link: %v", err)
 	}

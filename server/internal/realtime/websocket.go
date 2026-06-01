@@ -18,6 +18,13 @@ import (
 const (
 	websocketGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 	maxFrameSize  = 1 << 20 // 1 MiB per inbound client frame
+
+	// Keepalive parameters. We ping the client every pingPeriod and require any
+	// frame (a pong or other data) within pongWait, so a half-open TCP peer is
+	// reaped instead of pinning a goroutine and subscription indefinitely.
+	writeWait  = 10 * time.Second
+	pongWait   = 60 * time.Second
+	pingPeriod = (pongWait * 9) / 10
 )
 
 func ServeWebSocket(w http.ResponseWriter, r *http.Request, client *Client, unregister func()) error {
@@ -45,8 +52,12 @@ func ServeWebSocket(w http.ResponseWriter, r *http.Request, client *Client, unre
 		return err
 	}
 	defer conn.Close()
-	// Clear http.Server read/write deadlines for the long-lived connection.
-	_ = conn.SetDeadline(time.Time{})
+	// After hijack the http.Server no longer manages this connection. Set an
+	// explicit write deadline for the handshake (and refresh it before every
+	// subsequent write) rather than leaving the server's timeouts in place
+	// (which would kill the long-lived socket) or clearing them entirely
+	// (which would let a dead peer pin this goroutine forever).
+	_ = conn.SetWriteDeadline(time.Now().Add(writeWait))
 
 	accept := websocketAccept(key)
 	if _, err := fmt.Fprintf(rw, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n\r\n", accept); err != nil {
@@ -58,13 +69,24 @@ func ServeWebSocket(w http.ResponseWriter, r *http.Request, client *Client, unre
 
 	done := make(chan struct{})
 	go drainClientFrames(conn, done)
+	ticker := time.NewTicker(pingPeriod)
+	defer ticker.Stop()
 	for {
 		select {
 		case payload, ok := <-client.Send():
 			if !ok {
 				return nil
 			}
+			_ = conn.SetWriteDeadline(time.Now().Add(writeWait))
 			if err := writeTextFrame(rw, payload); err != nil {
+				return err
+			}
+			if err := rw.Flush(); err != nil {
+				return err
+			}
+		case <-ticker.C:
+			_ = conn.SetWriteDeadline(time.Now().Add(writeWait))
+			if err := writePingFrame(rw); err != nil {
 				return err
 			}
 			if err := rw.Flush(); err != nil {
@@ -76,6 +98,13 @@ func ServeWebSocket(w http.ResponseWriter, r *http.Request, client *Client, unre
 			return r.Context().Err()
 		}
 	}
+}
+
+func writePingFrame(w io.Writer) error {
+	// FIN bit set, opcode 0x9 (ping), zero-length payload. Server->client frames
+	// are never masked (RFC 6455 §5.1).
+	_, err := w.Write([]byte{0x89, 0x00})
+	return err
 }
 
 func originAllowed(r *http.Request) bool {
@@ -118,6 +147,7 @@ func writeTextFrame(w io.Writer, payload []byte) error {
 func drainClientFrames(conn net.Conn, done chan<- struct{}) {
 	defer close(done)
 	reader := bufio.NewReader(conn)
+	_ = conn.SetReadDeadline(time.Now().Add(pongWait))
 	for {
 		first, err := reader.ReadByte()
 		if err != nil {
@@ -163,5 +193,9 @@ func drainClientFrames(conn net.Conn, done chan<- struct{}) {
 		if opcode == 0x8 {
 			return
 		}
+		// A complete frame (data, ping, or pong) proves the peer is alive, so
+		// extend the read deadline. Compliant WebSocket clients answer our pings
+		// with pongs automatically, which keeps this refreshed on idle links.
+		_ = conn.SetReadDeadline(time.Now().Add(pongWait))
 	}
 }

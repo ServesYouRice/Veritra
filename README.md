@@ -49,6 +49,8 @@ Then open:
 http://localhost:8080/setup
 ```
 
+The browser page is a setup notice only until production client crypto is wired. Owner setup must come from a client that can generate a real device key package.
+
 Default data lives under `./data` unless `PRIVATE_MESSENGER_DATA_DIR` is set.
 
 ## Security Defaults
@@ -65,7 +67,7 @@ Default data lives under `./data` unless `PRIVATE_MESSENGER_DATA_DIR` is set.
 ## Repository Layout
 
 ```text
-server/   Go server, migrations, setup UI
+server/   Go server, migrations, setup notice
 mobile/   Flutter mobile client shell
 crypto/   Rust crypto boundary and docs
 deploy/   Docker Compose, Caddy, systemd

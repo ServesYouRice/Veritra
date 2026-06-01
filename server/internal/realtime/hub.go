@@ -24,8 +24,8 @@ func NewHub() *Hub {
 	return &Hub{subscribers: map[string]map[*Client]struct{}{}}
 }
 
-func (h *Hub) Register(accountID string) *Client {
-	client := &Client{accountID: accountID, send: make(chan []byte, 32)}
+func (h *Hub) Register(accountID, deviceID string) *Client {
+	client := &Client{accountID: accountID, deviceID: deviceID, send: make(chan []byte, 32)}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.subscribers[accountID] == nil {
@@ -44,7 +44,37 @@ func (h *Hub) Unregister(client *Client) {
 			delete(h.subscribers, client.accountID)
 		}
 	}
-	close(client.send)
+	client.Close()
+}
+
+func (h *Hub) DisconnectDevice(accountID, deviceID string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	clients := h.subscribers[accountID]
+	for client := range clients {
+		if client.deviceID == deviceID {
+			delete(clients, client)
+			client.Close()
+		}
+	}
+	if len(clients) == 0 {
+		delete(h.subscribers, accountID)
+	}
+}
+
+func (h *Hub) DisconnectAccountExceptDevice(accountID, keepDeviceID string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	clients := h.subscribers[accountID]
+	for client := range clients {
+		if client.deviceID != keepDeviceID {
+			delete(clients, client)
+			client.Close()
+		}
+	}
+	if len(clients) == 0 {
+		delete(h.subscribers, accountID)
+	}
 }
 
 // Publish sends a best-effort realtime copy of an already-durable event.
@@ -70,9 +100,17 @@ func (h *Hub) Publish(accountIDs []string, event Event) {
 
 type Client struct {
 	accountID string
+	deviceID  string
 	send      chan []byte
+	closeOnce sync.Once
 }
 
 func (c *Client) Send() <-chan []byte {
 	return c.send
+}
+
+func (c *Client) Close() {
+	c.closeOnce.Do(func() {
+		close(c.send)
+	})
 }

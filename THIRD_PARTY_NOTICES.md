@@ -8,6 +8,7 @@ This project is licensed AGPL-3.0-or-later. Dependency licenses must be compatib
 | --- | --- | --- | --- |
 | `modernc.org/sqlite` | Pure-Go SQLite driver | BSD-style / compatible notices required | Chosen to support single-binary builds without CGO. Verify exact transitive notices during release. |
 | `golang.org/x/crypto` | Password hashing helpers | BSD-3-Clause | Used for password fallback hashing. |
+| `flutter_secure_storage` | Platform secure storage for mobile sessions | BSD-3-Clause | Direct Flutter dependency; platform packages are pulled transitively by `flutter pub get`. |
 | Flutter SDK | Mobile client framework | BSD-3-Clause | Toolchain, not vendored. |
 
 ## Reference Projects Studied, Not Copied
@@ -20,4 +21,3 @@ Signal/libsignal, OpenMLS, Matrix/Synapse/Element, SimpleX Chat, Mattermost, Zul
 - Update this file with exact versions and transitive notices.
 - Preserve attribution for any permissively licensed code or assets.
 - Re-check GPL/AGPL compatibility before adding copyleft dependencies.
-

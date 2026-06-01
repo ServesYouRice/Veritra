@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
@@ -13,19 +14,25 @@ type Config struct {
 	DatabasePath   string
 	StoragePath    string
 	InstanceName   string
+	EnableMetrics  bool
 	TrustedProxies []*net.IPNet
 }
 
-func Load() Config {
+func Load() (Config, error) {
+	trustedProxies, err := parseCIDRs(getenv("PRIVATE_MESSENGER_TRUSTED_PROXIES", ""))
+	if err != nil {
+		return Config{}, err
+	}
 	cfg := Config{
 		Addr:           getenv("PRIVATE_MESSENGER_ADDR", ":8080"),
 		DataDir:        getenv("PRIVATE_MESSENGER_DATA_DIR", "./data"),
 		InstanceName:   getenv("PRIVATE_MESSENGER_INSTANCE_NAME", "Private Messenger"),
-		TrustedProxies: parseCIDRs(getenv("PRIVATE_MESSENGER_TRUSTED_PROXIES", "")),
+		EnableMetrics:  getenv("PRIVATE_MESSENGER_ENABLE_METRICS", "") == "1",
+		TrustedProxies: trustedProxies,
 	}
 	cfg.DatabasePath = getenv("PRIVATE_MESSENGER_DB_PATH", filepath.Join(cfg.DataDir, "private-messenger.db"))
 	cfg.StoragePath = getenv("PRIVATE_MESSENGER_STORAGE_PATH", filepath.Join(cfg.DataDir, "blobs"))
-	return cfg
+	return cfg, nil
 }
 
 func getenv(key, fallback string) string {
@@ -35,9 +42,9 @@ func getenv(key, fallback string) string {
 	return fallback
 }
 
-func parseCIDRs(raw string) []*net.IPNet {
+func parseCIDRs(raw string) ([]*net.IPNet, error) {
 	if strings.TrimSpace(raw) == "" {
-		return nil
+		return nil, nil
 	}
 	var result []*net.IPNet
 	for _, part := range strings.Split(raw, ",") {
@@ -54,9 +61,9 @@ func parseCIDRs(raw string) []*net.IPNet {
 		}
 		_, cidr, err := net.ParseCIDR(part)
 		if err != nil {
-			continue
+			return nil, fmt.Errorf("invalid PRIVATE_MESSENGER_TRUSTED_PROXIES CIDR %q: %w", part, err)
 		}
 		result = append(result, cidr)
 	}
-	return result
+	return result, nil
 }

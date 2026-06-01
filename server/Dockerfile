@@ -1,7 +1,7 @@
 FROM golang:1.25 AS build
 
 WORKDIR /src
-COPY server/go.mod ./
+COPY server/go.mod server/go.sum ./
 RUN go mod download
 COPY server/ ./
 RUN CGO_ENABLED=0 GOOS=linux go build -o /out/messenger-server ./cmd/messenger-server

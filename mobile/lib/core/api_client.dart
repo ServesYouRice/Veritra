@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -5,10 +6,13 @@ import 'models.dart';
 
 class ApiClient {
   ApiClient({required this.baseUrl, HttpClient? httpClient})
-      : _httpClient = httpClient ?? HttpClient();
+      : _httpClient = httpClient ?? HttpClient() {
+    _httpClient.connectionTimeout = const Duration(seconds: 15);
+  }
 
   final String baseUrl;
   final HttpClient _httpClient;
+  static const _requestTimeout = Duration(seconds: 30);
 
   Future<Map<String, Object?>> setupStatus() async {
     return _jsonRequest('GET', '/api/v1/setup/status');
@@ -30,25 +34,47 @@ class ApiClient {
           'device_key_package': base64Encode(deviceKeyPackage),
         },
         setupRequest: true);
-    return Session(baseUrl: baseUrl, token: json['token'] as String);
+    return _sessionFromAuthJson(json);
   }
 
   Future<Session> login(
-      {required String username, required String password}) async {
+      {required String username,
+      required String password,
+      required String deviceId}) async {
     final json = await _jsonRequest('POST', '/api/v1/auth/login',
         body: <String, Object?>{
           'username': username,
           'password': password,
+          'device_id': deviceId,
         });
-    return Session(baseUrl: baseUrl, token: json['token'] as String);
+    return _sessionFromAuthJson(json);
   }
 
   Future<List<Conversation>> conversations(String token) async {
     final json =
         await _jsonRequest('GET', '/api/v1/conversations', token: token);
     final rows = (json['conversations'] as List<Object?>? ?? const <Object?>[])
-        .cast<Map<String, Object?>>();
+        .map((row) => Map<String, Object?>.from(row as Map));
     return rows.map(Conversation.fromJson).toList();
+  }
+
+  Future<List<Device>> devices(String token) async {
+    final json = await _jsonRequest('GET', '/api/v1/devices/me', token: token);
+    final rows = (json['devices'] as List<Object?>? ?? const <Object?>[])
+        .map((row) => Map<String, Object?>.from(row as Map));
+    return rows.map(Device.fromJson).toList();
+  }
+
+  Future<void> logout(String token) async {
+    await _jsonRequest('POST', '/api/v1/auth/logout', token: token);
+  }
+
+  Future<void> logoutAll(String token) async {
+    await _jsonRequest('POST', '/api/v1/auth/logout-all', token: token);
+  }
+
+  Future<void> revokeDevice(String token, String deviceId) async {
+    await _jsonRequest('DELETE', '/api/v1/devices/$deviceId', token: token);
   }
 
   Future<Conversation> createConversation(String token, String kind) async {
@@ -63,6 +89,46 @@ class ApiClient {
   Future<void> sendEnvelope(String token, MessageEnvelope envelope) async {
     await _jsonRequest('POST', '/api/v1/messages/envelopes',
         token: token, body: envelope.toJson());
+  }
+
+  Future<List<ReceivedMessageEnvelope>> listMessages(
+    String token,
+    String conversationId, {
+    int limit = 50,
+    String? before,
+    String? after,
+  }) async {
+    final queryParameters = <String, String>{
+      'limit': limit.toString(),
+      if (before != null && before.isNotEmpty) 'before': before,
+      if (after != null && after.isNotEmpty) 'after': after,
+    };
+    final path = Uri(
+      path: '/api/v1/conversations/$conversationId/messages',
+      queryParameters: queryParameters,
+    ).toString();
+    final json = await _jsonRequest('GET', path, token: token);
+    final rows = (json['messages'] as List<Object?>? ?? const <Object?>[])
+        .map((row) => Map<String, Object?>.from(row as Map));
+    return rows.map(ReceivedMessageEnvelope.fromJson).toList();
+  }
+
+  Future<List<SyncEvent>> syncEvents(
+    String token, {
+    int after = 0,
+    int limit = 100,
+  }) async {
+    final path = Uri(
+      path: '/api/v1/sync/events',
+      queryParameters: <String, String>{
+        'after': after.toString(),
+        'limit': limit.toString(),
+      },
+    ).toString();
+    final json = await _jsonRequest('GET', path, token: token);
+    final rows = (json['events'] as List<Object?>? ?? const <Object?>[])
+        .map((row) => Map<String, Object?>.from(row as Map));
+    return rows.map(SyncEvent.fromJson).toList();
   }
 
   Future<void> sendReaction(
@@ -95,10 +161,12 @@ class ApiClient {
       'limit': limit.toString(),
       'offset': offset.toString(),
     };
-    final path = Uri(path: '/api/v1/search/metadata', queryParameters: queryParameters).toString();
+    final path =
+        Uri(path: '/api/v1/search/metadata', queryParameters: queryParameters)
+            .toString();
     final json = await _jsonRequest('GET', path, token: token);
     final rows = (json['results'] as List<Object?>? ?? const <Object?>[])
-        .cast<Map<String, Object?>>();
+        .map((row) => Map<String, Object?>.from(row as Map));
     return rows.map(MetadataSearchResult.fromJson).toList();
   }
 
@@ -146,11 +214,16 @@ class ApiClient {
     );
   }
 
-  Future<DeviceLink> approveDeviceLink(String token, String linkId) async {
+  Future<DeviceLink> approveDeviceLink(
+    String token,
+    String linkId,
+    String verificationCode,
+  ) async {
     final json = await _jsonRequest(
       'POST',
       '/api/v1/device-links/$linkId/approve',
       token: token,
+      body: <String, Object?>{'verification_code': verificationCode},
     );
     return DeviceLink.fromJson(
         Map<String, Object?>.from(json['device_link'] as Map));
@@ -167,7 +240,26 @@ class ApiClient {
     if (token == null) {
       return null;
     }
-    return Session(baseUrl: baseUrl, token: token);
+    return _sessionFromAuthJson(json);
+  }
+
+  Session _sessionFromAuthJson(Map<String, Object?> json) {
+    return Session(
+      baseUrl: baseUrl,
+      token: json['token'] as String,
+      accountId: json['account_id'] as String? ?? _nestedId(json['account']),
+      deviceId: json['device_id'] as String? ?? _nestedId(json['device']),
+    );
+  }
+
+  String? _nestedId(Object? value) {
+    if (value is Map) {
+      final id = value['id'];
+      if (id is String) {
+        return id;
+      }
+    }
+    return null;
   }
 
   Future<Map<String, Object?>> _jsonRequest(
@@ -179,7 +271,8 @@ class ApiClient {
     Map<String, String> extraHeaders = const <String, String>{},
   }) async {
     final uri = Uri.parse(baseUrl).resolve(path);
-    final request = await _httpClient.openUrl(method, uri);
+    final request =
+        await _httpClient.openUrl(method, uri).timeout(_requestTimeout);
     request.headers.contentType = ContentType.json;
     if (token != null) {
       request.headers.set(HttpHeaders.authorizationHeader, 'Bearer $token');
@@ -191,15 +284,15 @@ class ApiClient {
     if (body != null) {
       request.write(jsonEncode(body));
     }
-    final response = await request.close();
-    final text = await utf8.decodeStream(response);
+    final response = await request.close().timeout(_requestTimeout);
+    final text = await utf8.decodeStream(response).timeout(_requestTimeout);
     if (response.statusCode < 200 || response.statusCode >= 300) {
       throw ApiException(response.statusCode, text);
     }
     if (text.isEmpty) {
       return <String, Object?>{};
     }
-    return jsonDecode(text) as Map<String, Object?>;
+    return Map<String, Object?>.from(jsonDecode(text) as Map);
   }
 }
 
@@ -209,6 +302,38 @@ class ApiException implements Exception {
   final int statusCode;
   final String body;
 
+  String? get serverCode {
+    try {
+      final decoded = jsonDecode(body);
+      if (decoded is Map) {
+        final error = decoded['error'];
+        if (error is String) {
+          return error;
+        }
+      }
+    } catch (_) {
+      return null;
+    }
+    return null;
+  }
+
+  String get message {
+    switch (serverCode) {
+      case 'unauthorized':
+      case 'invalid_credentials':
+        return 'Sign-in failed.';
+      case 'device_id_required':
+        return 'This device must be linked before password sign-in.';
+      case 'forbidden':
+        return 'You do not have access to that action.';
+      case 'verification_code_mismatch':
+        return 'Verification code did not match.';
+      case 'storage_error':
+        return 'Server storage error.';
+    }
+    return 'Request failed ($statusCode).';
+  }
+
   @override
-  String toString() => 'ApiException($statusCode)';
+  String toString() => message;
 }

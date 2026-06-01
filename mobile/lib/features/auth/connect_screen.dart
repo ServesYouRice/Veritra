@@ -109,14 +109,16 @@ class _ConnectScreenState extends State<ConnectScreen> {
           else
             FilledButton.icon(
               onPressed: widget.state.busy ? null : _submit,
-              icon: Icon(mode == AuthMode.linkDevice
-                  ? Icons.qr_code_2
-                  : Icons.login),
+              icon: Icon(
+                  mode == AuthMode.linkDevice ? Icons.qr_code_2 : Icons.login),
               label: Text(_submitLabel),
             ),
           if (widget.state.error != null) ...<Widget>[
             const SizedBox(height: 12),
-            Text(widget.state.error!, style: TextStyle(color: Theme.of(context).colorScheme.error)),
+            Text(
+              widget.state.error!,
+              style: TextStyle(color: Theme.of(context).colorScheme.error),
+            ),
           ],
         ],
       ),
@@ -129,12 +131,13 @@ class _ConnectScreenState extends State<ConnectScreen> {
       return;
     }
     switch (mode) {
-    case AuthMode.owner:
-      return widget.state.createOwner(raw, username.text.trim(), password.text);
-    case AuthMode.signIn:
-      return widget.state.login(raw, username.text.trim(), password.text);
-    case AuthMode.linkDevice:
-      return widget.state.claimDeviceLink(raw, linkCode.text.trim());
+      case AuthMode.owner:
+        return widget.state
+            .createOwner(raw, username.text.trim(), password.text);
+      case AuthMode.signIn:
+        return widget.state.login(raw, username.text.trim(), password.text);
+      case AuthMode.linkDevice:
+        return widget.state.claimDeviceLink(raw, linkCode.text.trim());
     }
   }
 
@@ -214,12 +217,12 @@ class _ConnectScreenState extends State<ConnectScreen> {
 
   String get _submitLabel {
     switch (mode) {
-    case AuthMode.owner:
-      return 'Create owner';
-    case AuthMode.signIn:
-      return 'Sign in';
-    case AuthMode.linkDevice:
-      return 'Claim link';
+      case AuthMode.owner:
+        return 'Create owner';
+      case AuthMode.signIn:
+        return 'Sign in';
+      case AuthMode.linkDevice:
+        return 'Claim link';
     }
   }
 }
